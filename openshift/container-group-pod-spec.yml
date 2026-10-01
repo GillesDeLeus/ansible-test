@@ -1,0 +1,23 @@
+---
+# Paste into AAP: Instance Groups > Add container group > Customize pod spec.
+# The default container group does not mount a service account token, so the
+# in-cluster auth of the playbook only works with this override.
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: aap
+spec:
+  serviceAccountName: aap-nginx-patcher
+  automountServiceAccountToken: true
+  containers:
+    - name: worker
+      # Execution environment with kubernetes.core and the helm binary.
+      image: REPLACE_ME/ee-nginx-patch:latest
+      args:
+        - ansible-runner
+        - worker
+        - --private-data-dir=/runner
+      resources:
+        requests:
+          cpu: 250m
+          memory: 100Mi

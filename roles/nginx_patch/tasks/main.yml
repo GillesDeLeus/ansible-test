@@ -1,0 +1,10 @@
+---
+- name: Check the release and the requested patch
+  ansible.builtin.import_tasks: preflight.yml
+
+- name: Upgrade the Helm release
+  ansible.builtin.import_tasks: upgrade.yml
+
+- name: Verify the running pods
+  ansible.builtin.import_tasks: verify.yml
+  when: not ansible_check_mode

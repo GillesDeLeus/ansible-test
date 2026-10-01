@@ -1,0 +1,8 @@
+---
+galaxy_info:
+  role_name: nginx_patch
+  author: Gilles De Leus
+  description: Patch the image of a Helm-managed nginx release on OpenShift
+  license: MIT
+  min_ansible_version: "2.15"
+dependencies: []

@@ -1,0 +1,7 @@
+---
+- name: Patch the nginx Helm release on OpenShift
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    - role: nginx_patch

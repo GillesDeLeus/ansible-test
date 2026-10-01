@@ -1,0 +1,31 @@
+---
+# Required: set these in the AAP job template (extra vars or survey).
+nginx_patch_namespace: ""
+nginx_patch_release_name: ""
+# Chart name (with nginx_patch_chart_repo_url) or a full oci:// reference.
+nginx_patch_chart_ref: ""
+nginx_patch_chart_repo_url: ""
+# Fixed image tag that contains the CVE fix.
+nginx_patch_image_tag: ""
+
+# Tag being replaced. The run refuses to "patch" to this tag.
+nginx_patch_vulnerable_tag: "1.2.0"
+
+# Empty keeps the chart version that is currently deployed, so the image is
+# the only thing that changes. Set it only if the fix needs a newer chart.
+nginx_patch_chart_version: ""
+
+# Merged on top of the values of the deployed release. Adjust the key path if
+# the chart does not use image.tag.
+nginx_patch_value_overrides:
+  image:
+    tag: "{{ nginx_patch_image_tag | string }}"
+
+nginx_patch_rollout_timeout: 5m0s
+
+# Post-upgrade verification.
+nginx_patch_pod_label_selector: "app.kubernetes.io/instance={{ nginx_patch_release_name }}"
+# Only container images matching this regex are checked (ignores sidecars).
+nginx_patch_image_pattern: nginx
+nginx_patch_verify_retries: 12
+nginx_patch_verify_delay: 10

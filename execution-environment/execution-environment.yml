@@ -1,0 +1,23 @@
+---
+# Build: ansible-builder build -f execution-environment/execution-environment.yml -t ee-nginx-patch
+# Only needed if the execution environment you use has no helm binary.
+version: 3
+
+images:
+  base_image:
+    # Match the AAP version that is installed.
+    name: registry.redhat.io/ansible-automation-platform-25/ee-minimal-rhel9:latest
+
+dependencies:
+  galaxy: ../collections/requirements.yml
+  python:
+    - kubernetes>=24.2.0
+    - PyYAML>=3.11
+    - jsonpatch
+
+options:
+  package_manager_path: /usr/bin/microdnf
+
+additional_build_steps:
+  append_final:
+    - RUN curl -fsSL https://mirror.openshift.com/pub/openshift-v4/clients/helm/latest/helm-linux-amd64 -o /usr/local/bin/helm && chmod 0755 /usr/local/bin/helm

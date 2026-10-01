@@ -1,0 +1,51 @@
+---
+- name: Validate input
+  ansible.builtin.assert:
+    that:
+      - nginx_patch_namespace | length > 0
+      - nginx_patch_release_name | length > 0
+      - nginx_patch_chart_ref | length > 0
+      - nginx_patch_image_tag | string | length > 0
+      - nginx_patch_image_tag | string != nginx_patch_vulnerable_tag | string
+    fail_msg: >-
+      nginx_patch_namespace, nginx_patch_release_name, nginx_patch_chart_ref and
+      nginx_patch_image_tag are required, and nginx_patch_image_tag must differ
+      from the vulnerable tag ({{ nginx_patch_vulnerable_tag }}).
+    quiet: true
+
+- name: Read the deployed release
+  kubernetes.core.helm_info:
+    name: "{{ nginx_patch_release_name }}"
+    release_namespace: "{{ nginx_patch_namespace }}"
+  register: nginx_patch_release
+
+- name: Stop if the release does not exist
+  ansible.builtin.assert:
+    that:
+      - nginx_patch_release.status is defined
+    fail_msg: >-
+      Helm release {{ nginx_patch_release_name }} not found in namespace
+      {{ nginx_patch_namespace }}. Refusing to install a new release.
+    quiet: true
+
+# helm_info returns the chart as "<name>-<version>". status['values'] is the
+# pre-6.3.0 name of release_values (bracket syntax, .values is a dict method).
+- name: Record the current chart version and values
+  ansible.builtin.set_fact:
+    nginx_patch_target_chart_version: >-
+      {{ nginx_patch_chart_version
+         | default(nginx_patch_release.status.chart
+                   | regex_replace('^.+?-(\d+\.\d+\.\d+.*)$', '\1'), true) }}
+    nginx_patch_current_values: >-
+      {{ nginx_patch_release.status.release_values
+         | default(nginx_patch_release.status['values'], true)
+         | default({}, true) }}
+
+- name: Show what is about to change
+  ansible.builtin.debug:
+    msg:
+      release: "{{ nginx_patch_namespace }}/{{ nginx_patch_release_name }}"
+      revision: "{{ nginx_patch_release.status.revision }}"
+      deployed_chart: "{{ nginx_patch_release.status.chart }}"
+      target_chart_version: "{{ nginx_patch_target_chart_version }}"
+      value_overrides: "{{ nginx_patch_value_overrides }}"
