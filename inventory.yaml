@@ -1,17 +1,6 @@
 ---
+# Release variables live in group_vars/all.yml.
 all:
   hosts:
     localhost:
       ansible_connection: local
-      ansible_python_interpreter: "{{ ansible_playbook_python }}"
-  vars:
-    nginx_patch_namespace: vulnerable-nginx
-    nginx_patch_release_name: vulnerable-nginx
-    # The chart is in no Helm repository; charts/ holds the copy extracted
-    # from the deployed release.
-    nginx_patch_chart_ref: "{{ playbook_dir }}/charts/vulnerable-nginx"
-    # Deployed image is nginx:1.20.0 (the chart appVersion is 1.20).
-    nginx_patch_vulnerable_tag: "1.20.0"
-    nginx_patch_image_tag: "1.20.2"
-    # The chart labels its pods app=<release>, not app.kubernetes.io/instance.
-    nginx_patch_pod_label_selector: app=vulnerable-nginx

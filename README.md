@@ -8,7 +8,8 @@ credential.
 
 ```
 patch_nginx.yml                       playbook, runs on localhost inside the job pod
-inventory.yaml                        localhost and the variables of the vulnerable-nginx release
+inventory.yaml                        localhost only
+group_vars/all.yml                    variables of the vulnerable-nginx release (loaded with any inventory)
 charts/vulnerable-nginx/              chart of that release, extracted from the cluster
 collections/requirements.yml          kubernetes.core (installed by AAP on project sync)
 roles/nginx_patch/
@@ -49,7 +50,7 @@ execution-environment/                ansible-builder definition (kubernetes.cor
      (expires; create a new one and update the credential for later runs)
    - Verify SSL on, CA data:
      `oc get cm kube-root-ca.crt -n aap -o jsonpath='{.data.ca\.crt}'`
-5. Create a project from this repository, an inventory from `inventory.yaml`,
+5. Create a project from this repository, an inventory with a `localhost` host,
    and a job template for `patch_nginx.yml` with that execution environment
    and that credential. The default container group is fine.
 
