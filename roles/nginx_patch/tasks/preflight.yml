@@ -13,6 +13,19 @@
       from the vulnerable tag ({{ nginx_patch_vulnerable_tag }}).
     quiet: true
 
+# Without credentials helm falls back to http://localhost:8080, which hides
+# the real cause. AAP job pods mount no service account token, so the
+# credential on the job template is the only source.
+- name: Stop if the job has no cluster credentials
+  ansible.builtin.assert:
+    that:
+      - lookup('ansible.builtin.env', 'K8S_AUTH_HOST') | length > 0
+      - lookup('ansible.builtin.env', 'K8S_AUTH_API_KEY') | length > 0
+    fail_msg: >-
+      K8S_AUTH_HOST / K8S_AUTH_API_KEY are not set. Attach an "OpenShift or
+      Kubernetes API Bearer Token" credential to the job template (see README).
+    quiet: true
+
 - name: Read the deployed release
   kubernetes.core.helm_info:
     name: "{{ nginx_patch_release_name }}"

@@ -1,7 +1,10 @@
 ---
 # Apply once as a cluster admin: oc apply -f openshift/rbac.yml
-# Replace the two namespaces: "aap" (where AAP job pods run) and "nginx"
-# (where the Helm release lives).
+# Replace the two namespaces: "aap" (where the service account lives) and
+# "nginx" (where the Helm release lives).
+# AAP does not allow job pods to mount a service account token, so the token
+# goes into an AAP credential instead:
+#   oc create token aap-nginx-patcher -n aap --duration=24h
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -15,7 +18,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: aap-nginx-patcher-edit
-  namespace: nginx
+  namespace: vulnerable-nginx
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole

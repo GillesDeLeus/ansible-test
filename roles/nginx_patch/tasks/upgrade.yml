@@ -1,6 +1,7 @@
 ---
-# No kubeconfig/host/api_key: helm and the kubernetes client fall back to the
-# service account token mounted in the AAP job pod.
+# No kubeconfig/host/api_key: the kubernetes.core modules read K8S_AUTH_HOST,
+# K8S_AUTH_API_KEY and K8S_AUTH_SSL_CA_CERT, which AAP injects from the
+# "OpenShift or Kubernetes API Bearer Token" credential of the job template.
 # atomic rolls the release back by itself if the rollout does not become ready.
 - name: Upgrade the release to the patched image
   kubernetes.core.helm:

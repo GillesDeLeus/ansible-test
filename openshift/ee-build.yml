@@ -1,0 +1,39 @@
+---
+# Builds the execution environment inside the cluster and stores it in the
+# OpenShift internal registry, so no external registry is needed.
+# Apply once: oc apply -f openshift/ee-build.yml   (replace the "aap" namespace)
+# Follow:     oc logs -f bc/ee-nginx-patch -n aap
+# Image for AAP: image-registry.openshift-image-registry.svc:5000/aap/ee-nginx-patch:latest
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: ee-nginx-patch
+  namespace: aap
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: ee-nginx-patch
+  namespace: aap
+spec:
+  runPolicy: Serial
+  source:
+    # ee-supported already ships kubernetes.core and the kubernetes Python
+    # client, so helm is the only thing to add. Match the installed AAP version.
+    dockerfile: |
+      FROM registry.redhat.io/ansible-automation-platform-25/ee-supported-rhel9:latest
+      USER root
+      RUN arch=$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/') && \
+          curl -fsSL "https://mirror.openshift.com/pub/openshift-v4/clients/helm/latest/helm-linux-${arch}" -o /usr/local/bin/helm && \
+          chmod 0755 /usr/local/bin/helm && \
+          helm version
+      USER 1000
+  strategy:
+    type: Docker
+    dockerStrategy: {}
+  output:
+    to:
+      kind: ImageStreamTag
+      name: ee-nginx-patch:latest
+  triggers:
+    - type: ConfigChange

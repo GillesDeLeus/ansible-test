@@ -1,7 +1,8 @@
 # ansible-test
 
 Patches the image of a Helm-managed nginx release on OpenShift from Ansible
-Automation Platform (AAP), using the service account of the AAP job pod.
+Automation Platform (AAP), using a service account token stored in an AAP
+credential.
 
 ## Layout
 
@@ -15,7 +16,7 @@ roles/nginx_patch/
   tasks/upgrade.yml                   helm upgrade (atomic, waits for the rollout)
   tasks/verify.yml                    assert the running pods use the patched tag
 openshift/rbac.yml                    service account + RoleBinding in the nginx namespace
-openshift/container-group-pod-spec.yml  AAP container group that mounts that service account
+openshift/ee-build.yml                in-cluster build of the execution environment (adds helm)
 execution-environment/                ansible-builder definition (kubernetes.core + helm)
 ```
 
@@ -32,13 +33,24 @@ execution-environment/                ansible-builder definition (kubernetes.cor
 
 1. Replace the `aap` and `nginx` namespaces in `openshift/rbac.yml`, then
    `oc apply -f openshift/rbac.yml`.
-2. Make sure the execution environment has `helm`
-   (`podman run --rm <ee-image> helm version`). If not, build and push the one
-   in `execution-environment/`.
-3. In AAP, create a container group with the pod spec from
-   `openshift/container-group-pod-spec.yml` (set the namespace and the image).
-4. Create a project from this repository, an inventory from `inventory.yaml`,
-   and a job template for `patch_nginx.yml` that uses the container group.
+2. Build an execution environment that has `helm`. Without an external
+   registry: `oc apply -f openshift/ee-build.yml` builds it in the cluster and
+   stores it in the internal registry (needs the registry to be `Managed`).
+   With a registry: build and push the one in `execution-environment/`.
+3. In AAP, add that image as an execution environment
+   (`image-registry.openshift-image-registry.svc:5000/aap/ee-nginx-patch:latest`
+   for the in-cluster build).
+4. In AAP, create a credential of type "OpenShift or Kubernetes API Bearer
+   Token". AAP refuses `automountServiceAccountToken` in container group pod
+   specs, so the job pod cannot use its own service account.
+   - Endpoint: `https://kubernetes.default.svc`
+   - Token: `oc create token aap-nginx-patcher -n aap --duration=24h`
+     (expires; create a new one and update the credential for later runs)
+   - Verify SSL on, CA data:
+     `oc get cm kube-root-ca.crt -n aap -o jsonpath='{.data.ca\.crt}'`
+5. Create a project from this repository, an inventory from `inventory.yaml`,
+   and a job template for `patch_nginx.yml` with that execution environment
+   and that credential. The default container group is fine.
 
 ## Variables
 
