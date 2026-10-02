@@ -8,7 +8,8 @@ credential.
 
 ```
 patch_nginx.yml                       playbook, runs on localhost inside the job pod
-inventory.yaml                        localhost only
+inventory.yaml                        localhost and the variables of the vulnerable-nginx release
+charts/vulnerable-nginx/              chart of that release, extracted from the cluster
 collections/requirements.yml          kubernetes.core (installed by AAP on project sync)
 roles/nginx_patch/
   defaults/main.yml                   all variables
@@ -60,7 +61,7 @@ Set these on the job template (extra vars or a survey):
 | --- | --- | --- |
 | `nginx_patch_namespace` | yes | Namespace of the release |
 | `nginx_patch_release_name` | yes | Helm release name |
-| `nginx_patch_chart_ref` | yes | Chart name, or a full `oci://` reference |
+| `nginx_patch_chart_ref` | yes | Chart name, a full `oci://` reference, or a path to a chart directory |
 | `nginx_patch_chart_repo_url` | for non-OCI charts | Helm repository URL |
 | `nginx_patch_image_tag` | yes | Patched image tag |
 | `nginx_patch_vulnerable_tag` | no | Defaults to `1.2.0` |
