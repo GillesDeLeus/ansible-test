@@ -160,7 +160,7 @@
       become: false
       changed_when: true
       failed_when: false
-      no_log: true
+      no_log: false
 
     # Both messages are templated whatever the outcome, so everything taken
     # from the response has a default: a Scripted REST API need not answer
