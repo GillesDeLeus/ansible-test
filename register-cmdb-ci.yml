@@ -31,6 +31,15 @@
       x-sn-apikey: "{{ snow_api_key }}"
     snow_cmdb_table: cmdb_ci_server
     snow_cmdb_url: "{{ snow_host }}/api/now/table/{{ snow_cmdb_table }}"
+    # Serial number used to match the CI. Empty = the VM's own SMBIOS serial.
+    # Set it (e.g. on the job template) to update an existing demo CI that
+    # already has its relations, such as SNDVTLNUX1234.
+    cmdb_serial_number: ""
+    # Empty = create/update through the Table API (POST, or PATCH when the CI
+    # exists). A path such as /api/denbv/azure_link_demo/create_ci = always
+    # POST the payload to that Scripted REST API, which decides itself whether
+    # to create or update.
+    snow_cmdb_endpoint: ""
     # Reference fields (manufacturer -> core_company, model_id -> cmdb_model)
     # are sent by name and resolved by ServiceNow; a name with no matching or
     # readable record leaves the field empty. false leaves them out.
@@ -73,7 +82,7 @@
         cmdb_ci_payload: >-
           {{ {
                'name': inventory_hostname,
-               'serial_number': 'SNDVTLNUX1234',
+               'serial_number': cmdb_serial_number | default('', true) or ansible_facts['product_serial'],
                'manufacturer': snow_cmdb_manufacturer,
                'model_id': snow_cmdb_model,
                'comments': snow_cmdb_comments,
@@ -105,8 +114,8 @@
         fail_msg: "No SMBIOS serial number on {{ inventory_hostname }}: cannot match a CI."
         quiet: true
 
-    #The API key is a plain header, which Ansible does not mask, so the API
-    #calls are no_log and the asserts after them report errors instead.
+    # The API key is a plain header, which Ansible does not mask, so the API
+    # calls are no_log and the asserts after them report errors instead.
     - name: Look up an existing CI by serial number
       ansible.builtin.uri:
         url: >-
@@ -132,16 +141,20 @@
           {{ cmdb_lookup.json.error | default({}) | to_json if cmdb_lookup.status != 200 else '' }}
         quiet: true
 
+    - name: Remember the existing CI
+      ansible.builtin.set_fact:
+        cmdb_existing: "{{ cmdb_lookup.json.result | first | default({}) }}"
+
     - name: Create or update the CI
       ansible.builtin.uri:
         url: >-
-          https://eraneossecurity.service-now.com/api/denbv/azure_link_demo/create_ci
-        method: "{{ 'PATCH' if cmdb_existing else 'POST' }}"
+          {{ snow_host ~ snow_cmdb_endpoint if snow_cmdb_endpoint else
+             snow_cmdb_url ~ (('/' ~ cmdb_existing.sys_id) if cmdb_existing else '')
+             ~ '?sysparm_input_display_value=true&sysparm_fields=sys_id,name' }}
+        method: "{{ 'PATCH' if cmdb_existing and not snow_cmdb_endpoint else 'POST' }}"
         headers: "{{ snow_headers }}"
         body_format: json
         body: "{{ cmdb_ci_payload }}"
-      vars:
-        cmdb_existing: "{{ cmdb_lookup.json.result | first | default({}) }}"
       register: cmdb_write
       delegate_to: localhost
       become: false
@@ -149,13 +162,26 @@
       failed_when: false
       no_log: true
 
+    # Both messages are templated whatever the outcome, so everything taken
+    # from the response has a default: a Scripted REST API need not answer
+    # like the Table API.
     - name: Report the CI
       ansible.builtin.assert:
         that: cmdb_write.status in [200, 201]
         fail_msg: >-
-          Writing the CI for {{ inventory_hostname }} to {{ snow_cmdb_table }} failed: HTTP {{ cmdb_write.status }}
-          {{ '(no write access to ' ~ snow_cmdb_table ~ ', or to a field in the payload)' if cmdb_write.status == 403 else '' }}
-          {{ cmdb_write.json.error | default({}) | to_json }}
+          Writing the CI for {{ inventory_hostname }} to {{ cmdb_target_desc }} failed: HTTP {{ cmdb_write.status }}
+          {{ '(no write access, or a field in the payload is not allowed)' if cmdb_write.status == 403 else
+             '(method or path not accepted by the endpoint)' if cmdb_write.status in [404, 405] else '' }}
+          {{ cmdb_response }}
         success_msg: >-
-          {{ 'Created' if cmdb_write.status == 201 else 'Updated' }} CI {{ cmdb_write.json.result.name }}:
-          {{ snow_host }}/nav_to.do?uri={{ snow_cmdb_table }}.do?sys_id={{ cmdb_write.json.result.sys_id }}
+          {{ 'Updated' if cmdb_existing else 'Created' }} CI {{ inventory_hostname }}
+          (serial {{ cmdb_ci_payload.serial_number }}) via {{ cmdb_target_desc }}:
+          {{ (snow_host ~ '/nav_to.do?uri=' ~ snow_cmdb_table ~ '.do?sys_id=' ~ cmdb_sys_id) if cmdb_sys_id else cmdb_response }}
+      vars:
+        cmdb_target_desc: "{{ snow_cmdb_endpoint or snow_cmdb_table }}"
+        cmdb_result: "{{ (cmdb_write.json | default({})).result | default({}) }}"
+        cmdb_sys_id: >-
+          {{ cmdb_result.sys_id if (cmdb_result is mapping and cmdb_result.sys_id is defined)
+             else cmdb_existing.sys_id | default('') }}
+        cmdb_response: >-
+          {{ (cmdb_write.json | default(cmdb_write.content | default(cmdb_write.msg | default(''))) | string)[:500] }}

@@ -47,6 +47,9 @@
       x-sn-apikey: "{{ snow_api_key }}"
     snow_api: "{{ snow_host }}/api/now/table"
     snow_cmdb_table: cmdb_ci_server
+    # Same as in register-cmdb-ci.yml: empty = the VM's own SMBIOS serial.
+    cmdb_serial_number: ""
+    cmdb_serial: "{{ cmdb_serial_number | default('', true) or ansible_facts['product_serial'] }}"
     snow_cve_table: sn_vul_nvd_entry
     snow_vi_table: sn_vul_vulnerable_item
     # A vulnerable item must point to a vulnerability record. CVEs the NVD
@@ -198,7 +201,7 @@
       ansible.builtin.uri:
         url: >-
           {{ snow_api }}/{{ snow_cmdb_table }}?sysparm_limit=1&sysparm_fields=sys_id,name&sysparm_query={{
-          ('serial_number=' ~ ansible_facts['product_serial']) | urlencode }}
+          ('serial_number=' ~ cmdb_serial) | urlencode }}
         headers: "{{ snow_headers }}"
       register: snow_ci
       delegate_to: localhost
@@ -214,7 +217,7 @@
              if snow_ci.status == 401 else
              'The API key has no read access to ' ~ snow_cmdb_table ~ '.'
              if snow_ci.status == 403 else
-             'No ' ~ snow_cmdb_table ~ ' CI with serial ' ~ ansible_facts['product_serial']
+             'No ' ~ snow_cmdb_table ~ ' CI with serial ' ~ cmdb_serial
              ~ ': run register-cmdb-ci.yml first.' if snow_ci.status == 200 else
              'CMDB lookup failed: HTTP ' ~ snow_ci.status }}
         quiet: true
