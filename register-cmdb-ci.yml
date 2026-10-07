@@ -40,6 +40,10 @@
     # POST the payload to that Scripted REST API, which decides itself whether
     # to create or update.
     snow_cmdb_endpoint: ""
+    # Seconds to wait for ServiceNow to answer the create/update call. A
+    # Scripted REST API that builds relations can take longer than the
+    # uri module's default of 30.
+    snow_cmdb_timeout: 120
     # Reference fields (manufacturer -> core_company, model_id -> cmdb_model)
     # are sent by name and resolved by ServiceNow; a name with no matching or
     # readable record leaves the field empty. false leaves them out.
@@ -127,7 +131,7 @@
       delegate_to: localhost
       become: false
       failed_when: false
-      no_log: false
+      no_log: true
 
     - name: Check the lookup worked
       ansible.builtin.assert:
@@ -155,12 +159,13 @@
         headers: "{{ snow_headers }}"
         body_format: json
         body: "{{ cmdb_ci_payload }}"
+        timeout: "{{ snow_cmdb_timeout }}"
       register: cmdb_write
       delegate_to: localhost
       become: false
       changed_when: true
       failed_when: false
-      no_log: false
+      no_log: true
 
     # Both messages are templated whatever the outcome, so everything taken
     # from the response has a default: a Scripted REST API need not answer
@@ -170,7 +175,11 @@
         that: cmdb_write.status in [200, 201]
         fail_msg: >-
           Writing the CI for {{ inventory_hostname }} to {{ cmdb_target_desc }} failed: HTTP {{ cmdb_write.status }}
-          {{ '(no write access, or a field in the payload is not allowed)' if cmdb_write.status == 403 else
+          {{ '(no answer within ' ~ snow_cmdb_timeout ~ ' s: the endpoint is slow or hangs. ServiceNow may
+             still finish the change, so check the CI; raise snow_cmdb_timeout if it needs longer)'
+             if cmdb_write.status == -1 and 'timed out' in cmdb_write.msg | default('') else
+             '(no connection to ServiceNow)' if cmdb_write.status == -1 else
+             '(no write access, or a field in the payload is not allowed)' if cmdb_write.status == 403 else
              '(method or path not accepted by the endpoint)' if cmdb_write.status in [404, 405] else '' }}
           {{ cmdb_response }}
         success_msg: >-
