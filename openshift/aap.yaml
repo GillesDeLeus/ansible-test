@@ -1,0 +1,35 @@
+---
+apiVersion: aap.ansible.com/v1alpha1
+kind: AnsibleAutomationPlatform
+metadata:
+  labels:
+    app.kubernetes.io/managed-by: aap-operator
+    app.kubernetes.io/name: aap-snow-demo
+    app.kubernetes.io/operator-version: ''
+    app.kubernetes.io/part-of: aap-snow-demo
+  name: aap-snow-demo
+  namespace: aap
+spec:
+  route_tls_termination_mechanism: Edge
+  service_type: LoadBalancer
+  ingress_type: Route
+  no_log: true
+  redis_mode: standalone
+  image_pull_policy: IfNotPresent
+  hub:
+    file_storage_access_mode: ReadWriteMany
+    file_storage_size: 100Gi
+    file_storage_storage_class: azurefile-csi
+    storage_type: file
+  api:
+    log_level: INFO
+    replicas: 1
+  database:
+    idle_disabled: false
+    postgres_data_volume_init: false
+  route_host: aap.apps.aap-snow.aap-snow.innovative-tech.be
+  controller:
+    projects_persistence: true
+    projects_storage_class: azurefile-csi-nfs-aap
+    projects_storage_access_mode: ReadWriteMany
+    projects_storage_size: 8Gi

@@ -1,0 +1,52 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: aap-projects-test
+  namespace: aap
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: azurefile-csi-nfs-aap
+  resources:
+    requests:
+      storage: 8Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: aap-projects-test
+  namespace: aap
+spec:
+  restartPolicy: Never
+  containers:
+    - name: test
+      image: registry.access.redhat.com/ubi9/ubi-minimal:latest
+      command:
+        - sh
+        - -c
+        - |
+          set -x
+          id
+          mount | grep /var/lib/awx/projects
+          ls -ldn /var/lib/awx/projects
+          mkdir -p /var/lib/awx/projects/_12__test &&
+          chmod 0755 /var/lib/awx/projects/_12__test &&
+          echo hello > /var/lib/awx/projects/_12__test/test.yml &&
+          chmod 0644 /var/lib/awx/projects/_12__test/test.yml &&
+          ls -ln /var/lib/awx/projects/_12__test &&
+          rm -rf /var/lib/awx/projects/_12__test &&
+          echo "RESULT: OK" || echo "RESULT: FAILED"
+      volumeMounts:
+        - name: projects
+          mountPath: /var/lib/awx/projects
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+  volumes:
+    - name: projects
+      persistentVolumeClaim:
+        claimName: aap-projects-test
