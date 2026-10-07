@@ -8,6 +8,9 @@
 #   - Credential: Machine (user cloud-user, private key, become sudo)
 #   - Credential: custom "Red Hat Activation Key"             -> rhc_org_id / rhc_activation_key
 #     (aap/credential-type-activation-key.yml)
+#   - Credential: custom "ServiceNow" (aap/credential-type-servicenow.yml), for
+#     the CMDB CI created at the end (register-cmdb-ci.yml); set
+#     snow_cmdb_register: false to skip it
 #   - Extra var or survey: vm_name, vm_ssh_public_key, vm_os (+ optional overrides below)
 # The job pod SSHes to the VM's pod network IP, so it must run in the same
 # cluster (container group) and no NetworkPolicy may block port 22.
@@ -107,6 +110,7 @@
         groups: new_vms
         ansible_host: "{{ (vmi.resources[0].status.interfaces | selectattr('ipAddress', 'defined') | first).ipAddress }}"
         ansible_user: "{{ vm_user }}"
+        vm_namespace: "{{ vm_namespace }}"
 
 - name: Connect the VM to console.redhat.com and Insights
   hosts: new_vms
@@ -180,3 +184,6 @@
         inventory: "{{ aap_inventory_name }}"
         wait: true
       loop: "{{ aap_inventory_source_ids | default([]) }}"
+
+- name: Register the new VM in the ServiceNow CMDB
+  ansible.builtin.import_playbook: register-cmdb-ci.yml

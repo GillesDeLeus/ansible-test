@@ -15,6 +15,7 @@ charts/vulnerable-nginx/              chart of that release, extracted from the 
 provision-vm.yml                      create a RHEL VM on OpenShift Virtualization, register it with console.redhat.com
 aap/credential-type-activation-key.yml  custom AAP credential type for the RHSM activation key
 resolve-vulnerable-item.yml           set a ServiceNow vulnerable item to Resolved
+register-cmdb-ci.yml                  create/update the VM's cmdb_ci_linux_server CI (run at the end of provision-vm.yml)
 aap/credential-type-servicenow.yml    custom AAP credential type for ServiceNow (SN_HOST/SN_API_KEY)
 openshift/vm-rbac.yml                 namespace + service account for provision-vm.yml
 roles/nginx_patch/
@@ -105,7 +106,8 @@ One-time setup:
    `https://kubernetes.default.svc`, token from the `aap-vm-provisioner-token`
    secret, CA from `kube-root-ca.crt`.
 5. Machine credential: user `cloud-user`, the private key, privilege escalation `sudo`.
-6. Job template for `provision-vm.yml` with the three credentials, the
+6. Job template for `provision-vm.yml` with the three credentials plus the
+   ServiceNow one (for the CMDB CI, see below), the
    inventory with `localhost`, and a survey for `vm_name`, `vm_ssh_public_key` and
    `vm_os` (multiple choice `rhel8` / `rhel9` / `rhel10`).
 
@@ -142,3 +144,21 @@ is already Resolved is left alone.
 | `vulnerability_sys_id` | required | sys_id of the vulnerable item (32 hex characters) |
 | `snow_vi_resolved_state` | `Resolved` | State label to set (label, not number) |
 | `snow_vi_work_note` | AAP job reference | Work note added with the change |
+
+## CMDB configuration item (`register-cmdb-ci.yml`)
+
+Runs at the end of `provision-vm.yml` and creates a `cmdb_ci_linux_server` CI
+for the new VM through the Table API, or updates it when one with the same
+`serial_number` exists. OpenShift Virtualization keeps the SMBIOS serial on
+the VirtualMachine, so it survives restarts; a VM recreated under the same name
+gets a new serial and a new CI. Fields come from the VM's facts: name, serial,
+manufacturer/model (resolved by name, left empty when ServiceNow has no such
+record), host name, OS and version, pod IP (the guest only sees 10.0.2.2), RAM,
+CPU vendor/type/count/cores, `virtual: true`. Empty values are not sent.
+
+- Needs the ServiceNow credential (API key; the key's user needs write access
+  to `cmdb_ci_linux_server`, e.g. `itil` or `sn_cmdb_editor`).
+- `snow_cmdb_register: false` skips it.
+- Standalone, for VMs already in an AAP inventory: a job template for
+  `register-cmdb-ci.yml` with the Machine and ServiceNow credentials and
+  `cmdb_target: <host or group>`.
