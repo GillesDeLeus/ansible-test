@@ -11,7 +11,10 @@ patch_nginx.yml                       playbook, runs on localhost inside the job
 inventory.yaml                        localhost only
 group_vars/all.yml                    variables of the vulnerable-nginx release (loaded with any inventory)
 charts/vulnerable-nginx/              chart of that release, extracted from the cluster
-collections/requirements.yml          kubernetes.core (installed by AAP on project sync)
+collections/requirements.yml          collections installed by AAP on project sync
+provision-vm.yml                      create a RHEL VM on OpenShift Virtualization, register it with console.redhat.com
+aap/credential-type-activation-key.yml  custom AAP credential type for the RHSM activation key
+openshift/vm-rbac.yml                 namespace + service account for provision-vm.yml
 roles/nginx_patch/
   defaults/main.yml                   all variables
   tasks/preflight.yml                 input checks, read the deployed release
@@ -81,3 +84,34 @@ nginx_patch_image_tag: "1.2.1"
 Run the job template in check mode first: it shows the planned change without
 upgrading (install the `helm-diff` plugin in the execution environment for a
 full diff).
+
+## Provisioning RHEL VMs (`provision-vm.yml`)
+
+Creates a VM from the `rhel8` golden image, waits for SSH on its pod network
+IP, registers it with an activation key and enables rhc + Insights remediation.
+The job pod connects to the VM directly, so jobs must run in a container group
+on the same cluster.
+
+One-time setup:
+
+1. `oc apply -f openshift/vm-rbac.yml` (change `aap` / `rhel-vms` if needed).
+2. Organization -> Galaxy credentials: add an Automation Hub token credential
+   (console.redhat.com) above Ansible Galaxy, then sync the project.
+3. Credential type from `aap/credential-type-activation-key.yml`, plus one
+   credential of that type (org ID + activation key from console.redhat.com).
+4. Credential "OpenShift or Kubernetes API Bearer Token": endpoint
+   `https://kubernetes.default.svc`, token from the `aap-vm-provisioner-token`
+   secret, CA from `kube-root-ca.crt`.
+5. Machine credential: user `cloud-user`, the private key, privilege escalation `sudo`.
+6. Job template for `provision-vm.yml` with the three credentials, the
+   inventory with `localhost`, and a survey for `vm_name` and `vm_ssh_public_key`.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `vm_name` | required | VM name, lowercase DNS-1123 |
+| `vm_ssh_public_key` | required | Public key matching the Machine credential |
+| `vm_namespace` | `rhel-vms` | Namespace of the VM |
+| `vm_instancetype` / `vm_preference` | `u1.medium` / `rhel.8` | Cluster instance type and preference |
+| `vm_os_datasource` | `rhel8` | DataSource in `openshift-virtualization-os-images` |
+| `vm_disk_size` / `vm_storage_class` | `30Gi` / cluster default | Root disk |
+| `aap_inventory_name`, `aap_inventory_source_ids` | unset | Inventory sources to sync afterwards (needs an AAP credential) |
