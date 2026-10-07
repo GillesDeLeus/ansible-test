@@ -153,9 +153,21 @@
           remediation: present
           autoupdate: true
 
+    # The rhc role only registers when "insights-client --status" says "NOT"
+    # or "unregistered". On a never-registered RHEL 9.8 host
+    # (insights-client 3.9.3) it says "not yet been registered", so the role
+    # skips it. The .registered file only exists after a registration;
+    # --register also uploads the first report.
+    - name: Register with Insights if the rhc role did not
+      ansible.builtin.command: insights-client --register
+      args:
+        creates: /etc/insights-client/.registered
+      register: insights_register
+
     - name: Upload a first Insights report so the host shows up immediately
       ansible.builtin.command: insights-client
       changed_when: false
+      when: insights_register is skipped
 
 - name: Refresh AAP inventories so the new VM can be targeted (optional)
   hosts: localhost
