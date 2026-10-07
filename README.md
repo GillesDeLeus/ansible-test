@@ -11,7 +11,6 @@ patch_nginx.yml                       playbook, runs on localhost inside the job
 inventory.yaml                        localhost only
 group_vars/all.yml                    variables of the vulnerable-nginx release (loaded with any inventory)
 charts/vulnerable-nginx/              chart of that release, extracted from the cluster
-collections/requirements.yml          collections installed by AAP on project sync
 provision-vm.yml                      create a RHEL VM on OpenShift Virtualization, register it with console.redhat.com
 aap/credential-type-activation-key.yml  custom AAP credential type for the RHSM activation key
 openshift/vm-rbac.yml                 namespace + service account for provision-vm.yml
@@ -21,8 +20,8 @@ roles/nginx_patch/
   tasks/upgrade.yml                   helm upgrade (atomic, waits for the rollout)
   tasks/verify.yml                    assert the running pods use the patched tag
 openshift/rbac.yml                    service account + RoleBinding in the nginx namespace
-openshift/ee-build.yml                in-cluster build of the execution environment (adds helm)
-execution-environment/                ansible-builder definition (kubernetes.core + helm)
+openshift/ee-build.yml                in-cluster build of the execution environment (adds helm, kubevirt.core)
+execution-environment/                ansible-builder definition (helm + all collections, requirements.yml)
 ```
 
 ## What the playbook does
@@ -87,7 +86,7 @@ full diff).
 
 ## Provisioning RHEL VMs (`provision-vm.yml`)
 
-Creates a VM from the `rhel8` golden image, waits for SSH on its pod network
+Creates a VM from the `rhel9` golden image, waits for SSH on its pod network
 IP, registers it with an activation key and enables rhc + Insights remediation.
 The job pod connects to the VM directly, so jobs must run in a container group
 on the same cluster.
@@ -95,8 +94,8 @@ on the same cluster.
 One-time setup:
 
 1. `oc apply -f openshift/vm-rbac.yml` (change `aap` / `rhel-vms` if needed).
-2. Organization -> Galaxy credentials: add an Automation Hub token credential
-   (console.redhat.com) above Ansible Galaxy, then sync the project.
+2. Rebuild the execution environment (`oc apply -f openshift/ee-build.yml`):
+   it carries every collection, so the project has no collections/requirements.yml.
 3. Credential type from `aap/credential-type-activation-key.yml`, plus one
    credential of that type (org ID + activation key from console.redhat.com).
 4. Credential "OpenShift or Kubernetes API Bearer Token": endpoint
@@ -111,7 +110,7 @@ One-time setup:
 | `vm_name` | required | VM name, lowercase DNS-1123 |
 | `vm_ssh_public_key` | required | Public key matching the Machine credential |
 | `vm_namespace` | `rhel-vms` | Namespace of the VM |
-| `vm_instancetype` / `vm_preference` | `u1.medium` / `rhel.8` | Cluster instance type and preference |
-| `vm_os_datasource` | `rhel8` | DataSource in `openshift-virtualization-os-images` |
+| `vm_instancetype` / `vm_preference` | `u1.medium` / `rhel.9` | Cluster instance type and preference |
+| `vm_os_datasource` | `rhel9` | DataSource in `openshift-virtualization-os-images` |
 | `vm_disk_size` / `vm_storage_class` | `30Gi` / cluster default | Root disk |
 | `aap_inventory_name`, `aap_inventory_source_ids` | unset | Inventory sources to sync afterwards (needs an AAP credential) |

@@ -1,13 +1,12 @@
 ---
-# Installed by AAP at project sync. redhat.* and ansible.controller come from
-# Automation Hub: the organization needs an "Ansible Galaxy/Automation Hub API
-# Token" credential for console.redhat.com in its Galaxy credentials
-# (Access Management -> Organizations -> Galaxy credentials), listed before
-# Ansible Galaxy.
+# Collections baked into the execution environment. Not in collections/ on
+# purpose: AAP would download them again on every project sync.
+# redhat.* and ansible.controller come from Automation Hub, so ansible-builder
+# needs a Hub token (ANSIBLE_GALAXY_SERVER_* env vars or an ansible.cfg).
 collections:
   - name: kubernetes.core
     version: ">=3.0.0"
   - name: kubevirt.core
-    version: ">=2.0.0"
+    version: ">=2.0.0,<3.0.0"
   - name: redhat.rhel_system_roles
   - name: ansible.controller

@@ -20,8 +20,8 @@
   vars:
     vm_namespace: rhel-vms                  # must match openshift/vm-rbac.yml
     vm_instancetype: u1.medium
-    vm_preference: rhel.8
-    vm_os_datasource: rhel8                 # DataSource in openshift-virtualization-os-images
+    vm_preference: rhel.9
+    vm_os_datasource: rhel9                 # DataSource in openshift-virtualization-os-images
     vm_os_datasource_namespace: openshift-virtualization-os-images
     vm_disk_size: 30Gi
     vm_storage_class: ""                    # empty = cluster default
