@@ -24,8 +24,8 @@
   become: true
 
   vars:
-    snow_host: "{{ lookup('ansible.builtin.env', 'SN_HOST') | regex_replace('/+$', '') }}"
-    snow_api_key: "{{ lookup('ansible.builtin.env', 'SN_API_KEY') }}"
+    snow_host: "{{ lookup('ansible.builtin.env', 'SN_HOST') | trim | regex_replace('/+$', '') }}"
+    snow_api_key: "{{ lookup('ansible.builtin.env', 'SN_API_KEY') | trim }}"
     snow_headers:
       Accept: application/json
       x-sn-apikey: "{{ snow_api_key }}"
@@ -73,7 +73,7 @@
         cmdb_ci_payload: >-
           {{ {
                'name': inventory_hostname,
-               'serial_number': ansible_facts['product_serial'],
+               'serial_number': 'SNDVTLNUX1234',
                'manufacturer': snow_cmdb_manufacturer,
                'model_id': snow_cmdb_model,
                'comments': snow_cmdb_comments,
@@ -105,8 +105,8 @@
         fail_msg: "No SMBIOS serial number on {{ inventory_hostname }}: cannot match a CI."
         quiet: true
 
-    # The API key is a plain header, which Ansible does not mask, so the API
-    # calls are no_log and the asserts after them report errors instead.
+    #The API key is a plain header, which Ansible does not mask, so the API
+    #calls are no_log and the asserts after them report errors instead.
     - name: Look up an existing CI by serial number
       ansible.builtin.uri:
         url: >-
@@ -135,7 +135,7 @@
     - name: Create or update the CI
       ansible.builtin.uri:
         url: >-
-          {{ snow_cmdb_url }}{{ ('/' ~ cmdb_existing.sys_id) if cmdb_existing else '' }}?sysparm_input_display_value=true&sysparm_fields=sys_id,name
+          https://eraneossecurity.service-now.com/api/denbv/azure_link_demo/create_ci
         method: "{{ 'PATCH' if cmdb_existing else 'POST' }}"
         headers: "{{ snow_headers }}"
         body_format: json

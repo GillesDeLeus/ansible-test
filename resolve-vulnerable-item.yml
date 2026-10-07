@@ -16,8 +16,8 @@
   gather_facts: false
 
   vars:
-    snow_host: "{{ lookup('ansible.builtin.env', 'SN_HOST') | regex_replace('/+$', '') }}"
-    snow_api_key: "{{ lookup('ansible.builtin.env', 'SN_API_KEY') }}"
+    snow_host: "{{ lookup('ansible.builtin.env', 'SN_HOST') | trim | regex_replace('/+$', '') }}"
+    snow_api_key: "{{ lookup('ansible.builtin.env', 'SN_API_KEY') | trim }}"
     snow_headers:
       Accept: application/json
       x-sn-apikey: "{{ snow_api_key }}"
