@@ -127,7 +127,7 @@
       delegate_to: localhost
       become: false
       failed_when: false
-      no_log: true
+      no_log: false
 
     - name: Check the lookup worked
       ansible.builtin.assert:
