@@ -112,10 +112,6 @@
   hosts: new_vms
   gather_facts: false
   become: true
-  vars:
-    # group_vars/all.yml points every host at the execution environment's
-    # Python, which does not exist on the VM.
-    ansible_python_interpreter: auto_silent
 
   tasks:
     - name: Wait until SSH is available

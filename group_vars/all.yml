@@ -2,7 +2,7 @@
 # Loaded from next to the playbook, so it applies whatever inventory the AAP
 # job template uses (AAP does not read inventory.yaml unless it is added as a
 # "Sourced from a Project" inventory source).
-ansible_python_interpreter: "{{ ansible_playbook_python }}"
+# The Python interpreter for localhost is in host_vars/localhost.yml.
 
 nginx_patch_namespace: vulnerable-nginx
 nginx_patch_release_name: vulnerable-nginx

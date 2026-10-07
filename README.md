@@ -10,6 +10,7 @@ credential.
 patch_nginx.yml                       playbook, runs on localhost inside the job pod
 inventory.yaml                        localhost only
 group_vars/all.yml                    variables of the vulnerable-nginx release (loaded with any inventory)
+host_vars/localhost.yml               Python interpreter of the execution environment, for localhost only
 charts/vulnerable-nginx/              chart of that release, extracted from the cluster
 provision-vm.yml                      create a RHEL VM on OpenShift Virtualization, register it with console.redhat.com
 aap/credential-type-activation-key.yml  custom AAP credential type for the RHSM activation key
