@@ -179,9 +179,9 @@ Runs at the end of `provision-vm.yml`, after the CMDB CI exists. Per VM:
 5. Creates an `sn_vul_vulnerable_item` (CI + vulnerability, work note with
    impact, CVSS and fix availability) for each CVE that has none for this CI.
 
-CVEs without an `sn_vul_nvd_entry` record (not imported from NVD yet) are
-skipped and listed, unless `snow_create_missing_cves: true` creates a minimal
-record for them. Running it again only adds what is new.
+CVEs without an `sn_vul_nvd_entry` record (not imported from NVD yet) get a
+minimal record (CVE id + description from Insights), so every CVE gets a
+vulnerable item; `snow_create_missing_cves: false` skips and lists them instead. Running it again only adds what is new.
 
 Setup:
 
@@ -191,13 +191,13 @@ Setup:
 2. Credential type from `aap/credential-type-redhat-service-account.yml` and a
    credential with the client ID and secret.
 3. Add it and the ServiceNow credential to the provisioning job template. The
-   API key's user needs to create `sn_vul_vulnerable_item` records
-   (e.g. `sn_vul.vulnerability_admin`).
+   API key needs read/create on `sn_vul_vulnerable_item` and
+   `sn_vul_nvd_entry`, and read on `cmdb_ci_server`.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `insights_cves_sync` | `true` | `false` skips the playbook |
 | `insights_cve_filter` | empty (all CVEs) | Extra vulnerability API filter, e.g. `advisory_available=true` or `impact=5,7` |
-| `snow_create_missing_cves` | `false` | Create minimal `sn_vul_nvd_entry` records for CVEs ServiceNow does not know |
+| `snow_create_missing_cves` | `true` | Create minimal `sn_vul_nvd_entry` records for CVEs ServiceNow does not know (needs create access) |
 | `insights_inventory_wait_retries` / `insights_evaluation_wait_retries` | `15` / `30` | Waits, 20 s per retry |
 | `cve_sync_target` | `new_vms` | Host or group when run on its own |

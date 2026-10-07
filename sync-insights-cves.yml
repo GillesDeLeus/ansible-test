@@ -16,7 +16,8 @@
 # Flow per VM: Insights ID from the VM -> Insights inventory host ID -> wait
 # until the vulnerability service has evaluated the host -> list its CVEs ->
 # CMDB CI by serial number -> vulnerability record (sn_vul_nvd_entry) per CVE
-# -> create the vulnerable items that do not exist yet for that CI.
+# (created when missing) -> create the vulnerable items that do not exist
+# yet for that CI.
 
 - name: Create ServiceNow vulnerable items for the CVEs Insights reports
   hosts: "{{ cve_sync_target | default('new_vms') }}"
@@ -49,9 +50,10 @@
     snow_cve_table: sn_vul_nvd_entry
     snow_vi_table: sn_vul_vulnerable_item
     # A vulnerable item must point to a vulnerability record. CVEs the NVD
-    # import has not brought in yet are skipped, unless this creates a
-    # minimal record (id + summary) for them.
-    snow_create_missing_cves: false
+    # import has not brought in yet get a minimal record (id + summary from
+    # Insights); false skips and lists them instead. Needs create access to
+    # sn_vul_nvd_entry.
+    snow_create_missing_cves: true
     snow_query_batch: 50
 
   tasks:
@@ -266,7 +268,8 @@
           - snow_cve_lookup.results | rejectattr('status', 'eq', 200) | list | length == 0
           - snow_cve_created.results | default([]) | selectattr('status', 'defined') | rejectattr('status', 'eq', 201) | list | length == 0
         fail_msg: >-
-          Reading or creating {{ snow_cve_table }} records failed: HTTP
+          Reading or creating {{ snow_cve_table }} records failed (403: no read or create
+          access to {{ snow_cve_table }}; snow_create_missing_cves: false only reads): HTTP
           {{ (snow_cve_lookup.results + snow_cve_created.results | default([])) | selectattr('status', 'defined')
              | map(attribute='status') | reject('in', [200, 201]) | unique | join(', ') }}
         quiet: true
@@ -326,9 +329,13 @@
           {{ inventory_hostname }}: {{ insights_cves | length }} CVEs in Insights,
           {{ vi_created | length }} vulnerable items created,
           {{ snow_cve_ids | length - vi_created | length }} already existed,
+          {{ cve_records_created | length }} {{ snow_cve_table }} records created,
           {{ cves_skipped | length }} skipped (no {{ snow_cve_table }} record){{
           (': ' ~ cves_skipped | join(', ')) if cves_skipped else '' }}.
       vars:
         vi_failed: "{{ snow_vi_created.results | rejectattr('status', 'eq', 201) | list }}"
         vi_created: "{{ snow_vi_created.results | selectattr('status', 'eq', 201) | list }}"
         cves_skipped: "{{ insights_cves | difference(snow_cve_ids.keys()) }}"
+        cve_records_created: >-
+          {{ snow_cve_created.results | default([]) | selectattr('status', 'defined')
+             | selectattr('status', 'eq', 201) | list }}
