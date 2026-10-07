@@ -13,6 +13,8 @@ group_vars/all.yml                    variables of the vulnerable-nginx release 
 charts/vulnerable-nginx/              chart of that release, extracted from the cluster
 provision-vm.yml                      create a RHEL VM on OpenShift Virtualization, register it with console.redhat.com
 aap/credential-type-activation-key.yml  custom AAP credential type for the RHSM activation key
+resolve-vulnerable-item.yml           set a ServiceNow vulnerable item to Resolved
+aap/credential-type-servicenow.yml    custom AAP credential type for ServiceNow (SN_HOST/SN_API_KEY)
 openshift/vm-rbac.yml                 namespace + service account for provision-vm.yml
 roles/nginx_patch/
   defaults/main.yml                   all variables
@@ -86,7 +88,7 @@ full diff).
 
 ## Provisioning RHEL VMs (`provision-vm.yml`)
 
-Creates a VM from the `rhel9` golden image, waits for SSH on its pod network
+Creates a VM from the `rhel8`, `rhel9` or `rhel10` golden image (`vm_os`), waits for SSH on its pod network
 IP, registers it with an activation key and enables rhc + Insights remediation.
 The job pod connects to the VM directly, so jobs must run in a container group
 on the same cluster.
@@ -103,14 +105,39 @@ One-time setup:
    secret, CA from `kube-root-ca.crt`.
 5. Machine credential: user `cloud-user`, the private key, privilege escalation `sudo`.
 6. Job template for `provision-vm.yml` with the three credentials, the
-   inventory with `localhost`, and a survey for `vm_name` and `vm_ssh_public_key`.
+   inventory with `localhost`, and a survey for `vm_name`, `vm_ssh_public_key` and
+   `vm_os` (multiple choice `rhel8` / `rhel9` / `rhel10`).
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `vm_name` | required | VM name, lowercase DNS-1123 |
 | `vm_ssh_public_key` | required | Public key matching the Machine credential |
 | `vm_namespace` | `rhel-vms` | Namespace of the VM |
-| `vm_instancetype` / `vm_preference` | `u1.medium` / `rhel.9` | Cluster instance type and preference |
-| `vm_os_datasource` | `rhel9` | DataSource in `openshift-virtualization-os-images` |
+| `vm_os` | `rhel9` | RHEL version (`rhel8`, `rhel9`, `rhel10`); sets the DataSource and the preference |
+| `vm_instancetype` | `u1.medium` | Cluster instance type |
+| `vm_os_datasource` / `vm_preference` | from `vm_os` | Override only via extra vars, they must match |
 | `vm_disk_size` / `vm_storage_class` | `30Gi` / cluster default | Root disk |
 | `aap_inventory_name`, `aap_inventory_source_ids` | unset | Inventory sources to sync afterwards (needs an AAP credential) |
+
+## Resolving a ServiceNow vulnerable item (`resolve-vulnerable-item.yml`)
+
+Sets the `sn_vul_vulnerable_item` record with sys_id `vulnerability_sys_id` to
+`Resolved` through the Table API, adds a work note, then reads the record back
+and fails if ServiceNow kept the old state (business rule or ACL). An item that
+is already Resolved is left alone.
+
+1. In ServiceNow: a REST API key for an integration user that can write
+   vulnerable items (e.g. `sn_vul.remediation_owner`), and an API Access
+   Policy with the API Key authentication profile covering the Table API.
+2. Credential type from `aap/credential-type-servicenow.yml`, plus one
+   credential of that type (instance URL, API key).
+3. Job template for `resolve-vulnerable-item.yml` with that credential and the
+   inventory with `localhost`, and a required survey question
+   `vulnerability_sys_id` (text, 32 characters). Callers that launch through
+   the API pass it as `extra_vars`; the survey is what lets them.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `vulnerability_sys_id` | required | sys_id of the vulnerable item (32 hex characters) |
+| `snow_vi_resolved_state` | `Resolved` | State label to set (label, not number) |
+| `snow_vi_work_note` | AAP job reference | Work note added with the change |

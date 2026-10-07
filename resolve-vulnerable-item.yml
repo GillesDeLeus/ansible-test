@@ -1,0 +1,103 @@
+---
+# Set a ServiceNow Vulnerability Response vulnerable item to Resolved.
+#
+# Job template requirements (see README):
+#   - Credential: custom "ServiceNow" (aap/credential-type-servicenow.yml)
+#     -> SN_HOST / SN_API_KEY env vars (REST API key, sent as x-sn-apikey)
+#   - Extra var or survey: vulnerability_sys_id (sys_id of the sn_vul_vulnerable_item)
+# The API key needs an API Access Policy (API Key auth profile) covering the
+# Table API, and the user the key belongs to needs write access to
+# sn_vul_vulnerable_item (e.g. sn_vul.remediation_owner or
+# sn_vul.vulnerability_admin).
+
+- name: Resolve a vulnerable item in ServiceNow
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    snow_host: "{{ lookup('ansible.builtin.env', 'SN_HOST') | regex_replace('/+$', '') }}"
+    snow_api_key: "{{ lookup('ansible.builtin.env', 'SN_API_KEY') }}"
+    snow_headers:
+      Accept: application/json
+      x-sn-apikey: "{{ snow_api_key }}"
+    snow_vi_table: sn_vul_vulnerable_item
+    # Choice labels, not numbers: the API is called with
+    # sysparm_input_display_value=true, so the label is mapped to the value.
+    snow_vi_resolved_state: Resolved
+    snow_vi_work_note: "Remediated by Ansible Automation Platform (job {{ tower_job_id | default('n/a') }})."
+    snow_vi_url: "{{ snow_host }}/api/now/table/{{ snow_vi_table }}/{{ vulnerability_sys_id | default('') }}"
+
+  tasks:
+    - name: Check required variables
+      ansible.builtin.assert:
+        that:
+          - vulnerability_sys_id is defined
+          - vulnerability_sys_id is match('^[0-9a-f]{32}$')
+          - snow_host | length > 0
+          - snow_api_key | length > 0
+        fail_msg: >-
+          Set vulnerability_sys_id (32 hex characters) and attach the ServiceNow credential.
+
+    # The API key is a plain header, which Ansible does not mask, so the API
+    # calls are no_log and the asserts after them report errors instead.
+    - name: Read the vulnerable item
+      ansible.builtin.uri:
+        url: "{{ snow_vi_url }}?sysparm_display_value=true&sysparm_fields=number,state"
+        method: GET
+        headers: "{{ snow_headers }}"
+      register: vi_before
+      failed_when: false
+      no_log: true
+
+    - name: Check the vulnerable item was read
+      ansible.builtin.assert:
+        that: vi_before.status == 200
+        fail_msg: >-
+          {{ 'No ' ~ snow_vi_table ~ ' record with sys_id ' ~ vulnerability_sys_id ~ '.'
+             if vi_before.status == 404 else
+             'ServiceNow rejected the API key (check the key and the API Access Policy).'
+             if vi_before.status in [401, 403] else
+             'Reading the record failed: HTTP ' ~ vi_before.status ~ ' '
+             ~ (vi_before.json.error.message | default(vi_before.msg | default(''))) }}
+        quiet: true
+
+    - name: Set the vulnerable item to {{ snow_vi_resolved_state }}
+      ansible.builtin.uri:
+        url: "{{ snow_vi_url }}?sysparm_input_display_value=true&sysparm_display_value=true&sysparm_fields=number,state"
+        method: PATCH
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          state: "{{ snow_vi_resolved_state }}"
+          work_notes: "{{ snow_vi_work_note }}"
+      register: vi_after
+      when: vi_before.json.result.state != snow_vi_resolved_state
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+    - name: Check the update was accepted
+      ansible.builtin.assert:
+        that: vi_after.status == 200
+        fail_msg: >-
+          Updating {{ vi_before.json.result.number }} failed: HTTP {{ vi_after.status }}
+          {{ vi_after.json.error.message | default(vi_after.msg | default('')) }}
+        quiet: true
+      when: vi_after is not skipped
+
+    # Business rules or ACLs can silently keep the old state while the API
+    # still answers 200, so check what was actually stored.
+    - name: Verify the new state
+      ansible.builtin.assert:
+        that: vi_after.json.result.state == snow_vi_resolved_state
+        fail_msg: >-
+          {{ vi_after.json.result.number }} is still "{{ vi_after.json.result.state }}":
+          ServiceNow refused the change (business rule, ACL or missing role).
+        success_msg: "{{ vi_after.json.result.number }} is now {{ snow_vi_resolved_state }}."
+      when: vi_after is not skipped
+
+    - name: Report an item that was already resolved
+      ansible.builtin.debug:
+        msg: "{{ vi_before.json.result.number }} was already {{ snow_vi_resolved_state }}."
+      when: vi_after is skipped

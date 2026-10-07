@@ -8,7 +8,7 @@
 #   - Credential: Machine (user cloud-user, private key, become sudo)
 #   - Credential: custom "Red Hat Activation Key"             -> rhc_org_id / rhc_activation_key
 #     (aap/credential-type-activation-key.yml)
-#   - Extra var or survey: vm_name, vm_ssh_public_key (+ optional overrides below)
+#   - Extra var or survey: vm_name, vm_ssh_public_key, vm_os (+ optional overrides below)
 # The job pod SSHes to the VM's pod network IP, so it must run in the same
 # cluster (container group) and no NetworkPolicy may block port 22.
 
@@ -20,8 +20,11 @@
   vars:
     vm_namespace: rhel-vms                  # must match openshift/vm-rbac.yml
     vm_instancetype: u1.medium
-    vm_preference: rhel.9
-    vm_os_datasource: rhel9                 # DataSource in openshift-virtualization-os-images
+    vm_os: rhel9                            # survey: rhel8 | rhel9 | rhel10
+    # Both follow vm_os so image and preference always match; override only
+    # through extra vars.
+    vm_os_datasource: "{{ vm_os }}"         # DataSource in openshift-virtualization-os-images
+    vm_preference: "{{ vm_os | replace('rhel', 'rhel.') }}"
     vm_os_datasource_namespace: openshift-virtualization-os-images
     vm_disk_size: 30Gi
     vm_storage_class: ""                    # empty = cluster default
@@ -34,7 +37,8 @@
           - vm_name is defined and vm_name | length > 0
           - vm_name is match('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
           - vm_ssh_public_key is defined and vm_ssh_public_key | length > 0
-        fail_msg: "Set vm_name (DNS-1123, lowercase) and vm_ssh_public_key."
+          - vm_os is match('^rhel[0-9]+$')    # registration needs RHEL
+        fail_msg: "Set vm_name (DNS-1123, lowercase), vm_ssh_public_key and vm_os (rhel8, rhel9, rhel10)."
 
     - name: Create or update the VirtualMachine
       kubevirt.core.kubevirt_vm:
