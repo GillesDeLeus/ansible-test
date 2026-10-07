@@ -57,7 +57,9 @@
           {{ 'No ' ~ snow_vi_table ~ ' record with sys_id ' ~ vulnerability_sys_id ~ '.'
              if vi_before.status == 404 else
              'ServiceNow rejected the API key (check the key and the API Access Policy).'
-             if vi_before.status in [401, 403] else
+             if vi_before.status == 401 else
+             'The API key has no read access to ' ~ snow_vi_table ~ '.'
+             if vi_before.status == 403 else
              'Reading the record failed: HTTP ' ~ vi_before.status ~ ' '
              ~ (vi_before.json.error.message | default(vi_before.msg | default(''))) }}
         quiet: true

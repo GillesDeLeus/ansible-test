@@ -11,6 +11,10 @@
 #   - Credential: custom "ServiceNow" (aap/credential-type-servicenow.yml), for
 #     the CMDB CI created at the end (register-cmdb-ci.yml); set
 #     snow_cmdb_register: false to skip it
+#   - Credential: custom "Red Hat Service Account"
+#     (aap/credential-type-redhat-service-account.yml), for the ServiceNow
+#     vulnerable items created from the VM's Insights CVEs at the end
+#     (sync-insights-cves.yml); set insights_cves_sync: false to skip it
 #   - Extra var or survey: vm_name, vm_ssh_public_key, vm_os (+ optional overrides below)
 # The job pod SSHes to the VM's pod network IP, so it must run in the same
 # cluster (container group) and no NetworkPolicy may block port 22.
@@ -187,3 +191,7 @@
 
 - name: Register the new VM in the ServiceNow CMDB
   ansible.builtin.import_playbook: register-cmdb-ci.yml
+
+# Waits for the first Insights vulnerability evaluation (usually a few minutes).
+- name: Create ServiceNow vulnerable items for the VM's Insights CVEs
+  ansible.builtin.import_playbook: sync-insights-cves.yml

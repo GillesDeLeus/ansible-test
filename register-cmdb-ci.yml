@@ -1,5 +1,5 @@
 ---
-# Create or update a Linux server configuration item (cmdb_ci_linux_server)
+# Create or update a server configuration item (cmdb_ci_server)
 # in the ServiceNow CMDB for each VM in cmdb_target.
 #
 # Imported at the end of provision-vm.yml (cmdb_target defaults to the
@@ -10,8 +10,9 @@
 #   - Credential: custom "ServiceNow" (aap/credential-type-servicenow.yml)
 #     -> SN_HOST / SN_API_KEY env vars
 #   - Credential: Machine (the facts come from the VM, dmidecode needs sudo)
-# The API key's user needs write access to cmdb_ci_linux_server (e.g. itil or
-# sn_cmdb_editor). Set snow_cmdb_register: false to skip this playbook.
+# The API key's user needs read/write access to cmdb_ci_server. Access to a
+# parent table does not cover its child classes, so the CI is created in
+# cmdb_ci_server itself, not cmdb_ci_linux_server. Set snow_cmdb_register: false to skip this playbook.
 #
 # The CI is matched on serial_number: OpenShift Virtualization stores the
 # SMBIOS serial on the VirtualMachine, so it survives restarts, and a VM
@@ -28,10 +29,12 @@
     snow_headers:
       Accept: application/json
       x-sn-apikey: "{{ snow_api_key }}"
-    snow_cmdb_table: cmdb_ci_linux_server
+    snow_cmdb_table: cmdb_ci_server
     snow_cmdb_url: "{{ snow_host }}/api/now/table/{{ snow_cmdb_table }}"
-    # Reference fields (manufacturer, model_id) are sent by name and resolved
-    # by ServiceNow; a name with no matching record leaves the field empty.
+    # Reference fields (manufacturer -> core_company, model_id -> cmdb_model)
+    # are sent by name and resolved by ServiceNow; a name with no matching or
+    # readable record leaves the field empty. false leaves them out.
+    snow_cmdb_references: true
     snow_cmdb_manufacturer: "{{ ansible_facts['system_vendor'] }}"
     snow_cmdb_model: "{{ ansible_facts['product_name'] }}"
     snow_cmdb_comments: >-
@@ -88,7 +91,9 @@
                'cpu_count': ansible_facts['processor_count'] | int,
                'cpu_core_count': ansible_facts['processor_cores'] | int,
                'virtual': true,
-             } | dict2items | rejectattr('value', 'in', ['', none, 'NA']) | items2dict }}
+             } | dict2items | rejectattr('value', 'in', ['', none, 'NA'])
+               | rejectattr('key', 'in', [] if snow_cmdb_references | bool else ['manufacturer', 'model_id'])
+               | items2dict }}
       vars:
         cpu_vendor: "{{ ansible_facts['processor'][1] | default('') }}"
         cpu_model: "{{ ansible_facts['processor'][2] | default('') }}"
@@ -113,16 +118,18 @@
       delegate_to: localhost
       become: false
       failed_when: false
-      no_log: false
+      no_log: true
 
     - name: Check the lookup worked
       ansible.builtin.assert:
         that: cmdb_lookup.status == 200
         fail_msg: >-
           {{ 'ServiceNow rejected the API key (check the key and the API Access Policy).'
-             if cmdb_lookup.status in [401, 403] else
-             'CMDB lookup failed: HTTP ' ~ cmdb_lookup.status ~ ' '
-             ~ (cmdb_lookup.json.error.message | default(cmdb_lookup.msg | default(''))) }}
+             if cmdb_lookup.status == 401 else
+             'The API key has no read access to ' ~ snow_cmdb_table ~ '.'
+             if cmdb_lookup.status == 403 else
+             'CMDB lookup failed: HTTP ' ~ cmdb_lookup.status }}
+          {{ cmdb_lookup.json.error | default({}) | to_json if cmdb_lookup.status != 200 else '' }}
         quiet: true
 
     - name: Create or update the CI
@@ -146,8 +153,9 @@
       ansible.builtin.assert:
         that: cmdb_write.status in [200, 201]
         fail_msg: >-
-          Writing the CI for {{ inventory_hostname }} failed: HTTP {{ cmdb_write.status }}
-          {{ cmdb_write.json.error.message | default(cmdb_write.msg | default('')) }}
+          Writing the CI for {{ inventory_hostname }} to {{ snow_cmdb_table }} failed: HTTP {{ cmdb_write.status }}
+          {{ '(no write access to ' ~ snow_cmdb_table ~ ', or to a field in the payload)' if cmdb_write.status == 403 else '' }}
+          {{ cmdb_write.json.error | default({}) | to_json }}
         success_msg: >-
           {{ 'Created' if cmdb_write.status == 201 else 'Updated' }} CI {{ cmdb_write.json.result.name }}:
           {{ snow_host }}/nav_to.do?uri={{ snow_cmdb_table }}.do?sys_id={{ cmdb_write.json.result.sys_id }}

@@ -15,7 +15,10 @@ charts/vulnerable-nginx/              chart of that release, extracted from the 
 provision-vm.yml                      create a RHEL VM on OpenShift Virtualization, register it with console.redhat.com
 aap/credential-type-activation-key.yml  custom AAP credential type for the RHSM activation key
 resolve-vulnerable-item.yml           set a ServiceNow vulnerable item to Resolved
-register-cmdb-ci.yml                  create/update the VM's cmdb_ci_linux_server CI (run at the end of provision-vm.yml)
+register-cmdb-ci.yml                  create/update the VM's cmdb_ci_server CI (run at the end of provision-vm.yml)
+sync-insights-cves.yml                ServiceNow vulnerable item per Insights CVE of the VM (run after register-cmdb-ci.yml)
+tasks/redhat-api-token.yml            console.redhat.com token for the service account
+aap/credential-type-redhat-service-account.yml  custom AAP credential type for the Red Hat service account
 aap/credential-type-servicenow.yml    custom AAP credential type for ServiceNow (SN_HOST/SN_API_KEY)
 openshift/vm-rbac.yml                 namespace + service account for provision-vm.yml
 roles/nginx_patch/
@@ -147,18 +150,54 @@ is already Resolved is left alone.
 
 ## CMDB configuration item (`register-cmdb-ci.yml`)
 
-Runs at the end of `provision-vm.yml` and creates a `cmdb_ci_linux_server` CI
+Runs at the end of `provision-vm.yml` and creates a `cmdb_ci_server` CI
 for the new VM through the Table API, or updates it when one with the same
 `serial_number` exists. OpenShift Virtualization keeps the SMBIOS serial on
 the VirtualMachine, so it survives restarts; a VM recreated under the same name
 gets a new serial and a new CI. Fields come from the VM's facts: name, serial,
 manufacturer/model (resolved by name, left empty when ServiceNow has no such
-record), host name, OS and version, pod IP (the guest only sees 10.0.2.2), RAM,
+record; `snow_cmdb_references: false` leaves them out), host name, OS and version, pod IP (the guest only sees 10.0.2.2), RAM,
 CPU vendor/type/count/cores, `virtual: true`. Empty values are not sent.
 
 - Needs the ServiceNow credential (API key; the key's user needs write access
-  to `cmdb_ci_linux_server`, e.g. `itil` or `sn_cmdb_editor`).
+  to `cmdb_ci_server`). The CI goes into `cmdb_ci_server` itself: access to a
+  parent table does not cover child classes such as `cmdb_ci_linux_server`.
 - `snow_cmdb_register: false` skips it.
 - Standalone, for VMs already in an AAP inventory: a job template for
   `register-cmdb-ci.yml` with the Machine and ServiceNow credentials and
   `cmdb_target: <host or group>`.
+
+## Insights CVEs as ServiceNow vulnerable items (`sync-insights-cves.yml`)
+
+Runs at the end of `provision-vm.yml`, after the CMDB CI exists. Per VM:
+
+1. Reads the Insights ID (`/etc/insights-client/machine-id`) and serial from the VM.
+2. Waits until the host is in Insights inventory (up to 5 min) and until the
+   vulnerability service has evaluated it (up to 10 min; it answers 404 before).
+3. Lists the host's CVEs (paged), optionally filtered with `insights_cve_filter`.
+4. Finds the CMDB CI by serial, and the `sn_vul_nvd_entry` record of each CVE.
+5. Creates an `sn_vul_vulnerable_item` (CI + vulnerability, work note with
+   impact, CVSS and fix availability) for each CVE that has none for this CI.
+
+CVEs without an `sn_vul_nvd_entry` record (not imported from NVD yet) are
+skipped and listed, unless `snow_create_missing_cves: true` creates a minimal
+record for them. Running it again only adds what is new.
+
+Setup:
+
+1. console.redhat.com -> Settings -> Service Accounts: create one, then in User
+   Access add it to a group with the "Vulnerability viewer" and "Inventory
+   Hosts viewer" roles.
+2. Credential type from `aap/credential-type-redhat-service-account.yml` and a
+   credential with the client ID and secret.
+3. Add it and the ServiceNow credential to the provisioning job template. The
+   API key's user needs to create `sn_vul_vulnerable_item` records
+   (e.g. `sn_vul.vulnerability_admin`).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `insights_cves_sync` | `true` | `false` skips the playbook |
+| `insights_cve_filter` | empty (all CVEs) | Extra vulnerability API filter, e.g. `advisory_available=true` or `impact=5,7` |
+| `snow_create_missing_cves` | `false` | Create minimal `sn_vul_nvd_entry` records for CVEs ServiceNow does not know |
+| `insights_inventory_wait_retries` / `insights_evaluation_wait_retries` | `15` / `30` | Waits, 20 s per retry |
+| `cve_sync_target` | `new_vms` | Host or group when run on its own |

@@ -1,0 +1,334 @@
+---
+# Create a ServiceNow vulnerable item (sn_vul_vulnerable_item) for every CVE
+# Red Hat Insights reports on a VM, linked to the VM's CMDB CI.
+#
+# Imported at the end of provision-vm.yml, after register-cmdb-ci.yml
+# (cve_sync_target defaults to the new_vms group). Can also run on its own
+# against VMs in an AAP inventory: set cve_sync_target to a host or group.
+#
+# Job template requirements (see README):
+#   - Credential: custom "Red Hat Service Account"
+#     (aap/credential-type-redhat-service-account.yml) -> RH_CLIENT_ID / RH_CLIENT_SECRET
+#   - Credential: custom "ServiceNow" (aap/credential-type-servicenow.yml)
+#   - Credential: Machine (reads the Insights ID and serial from the VM)
+# Set insights_cves_sync: false to skip this playbook.
+#
+# Flow per VM: Insights ID from the VM -> Insights inventory host ID -> wait
+# until the vulnerability service has evaluated the host -> list its CVEs ->
+# CMDB CI by serial number -> vulnerability record (sn_vul_nvd_entry) per CVE
+# -> create the vulnerable items that do not exist yet for that CI.
+
+- name: Create ServiceNow vulnerable items for the CVEs Insights reports
+  hosts: "{{ cve_sync_target | default('new_vms') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    rh_client_id: "{{ lookup('ansible.builtin.env', 'RH_CLIENT_ID') }}"
+    rh_client_secret: "{{ lookup('ansible.builtin.env', 'RH_CLIENT_SECRET') }}"
+    rh_token_url: https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token
+    rh_api_url: https://console.redhat.com/api
+    # Waits right after provisioning: the host appears in Insights inventory
+    # after its first upload, the vulnerability service evaluates it a few
+    # minutes later. Retries every 20 seconds.
+    insights_inventory_wait_retries: 15        # 5 minutes
+    insights_evaluation_wait_retries: 30       # 10 minutes
+    # Extra filter parameters for the Insights CVE list, e.g.
+    # "advisory_available=true" (only CVEs with a fix) or "impact=5,7"
+    # (Important, Critical). Empty = every CVE.
+    insights_cve_filter: ""
+    insights_cve_page_size: 100
+
+    snow_host: "{{ lookup('ansible.builtin.env', 'SN_HOST') | regex_replace('/+$', '') }}"
+    snow_api_key: "{{ lookup('ansible.builtin.env', 'SN_API_KEY') }}"
+    snow_headers:
+      Accept: application/json
+      x-sn-apikey: "{{ snow_api_key }}"
+    snow_api: "{{ snow_host }}/api/now/table"
+    snow_cmdb_table: cmdb_ci_server
+    snow_cve_table: sn_vul_nvd_entry
+    snow_vi_table: sn_vul_vulnerable_item
+    # A vulnerable item must point to a vulnerability record. CVEs the NVD
+    # import has not brought in yet are skipped, unless this creates a
+    # minimal record (id + summary) for them.
+    snow_create_missing_cves: false
+    snow_query_batch: 50
+
+  tasks:
+    - name: Skip when the CVE sync is disabled
+      ansible.builtin.meta: end_play
+      when: not (insights_cves_sync | default(true) | bool)
+
+    - name: Check the credentials
+      ansible.builtin.assert:
+        that:
+          - rh_client_id | length > 0
+          - rh_client_secret | length > 0
+          - snow_host | length > 0
+          - snow_api_key | length > 0
+        fail_msg: >-
+          Attach the Red Hat Service Account and ServiceNow credentials, or set
+          insights_cves_sync: false to skip the CVE sync.
+        quiet: true
+      run_once: true
+
+    # --- Identify the VM in Insights ---------------------------------------
+
+    - name: Read the Insights ID of the VM
+      ansible.builtin.slurp:
+        src: /etc/insights-client/machine-id
+      register: insights_machine_id
+      failed_when: false
+
+    - name: Check the VM is registered with Insights
+      ansible.builtin.assert:
+        that: insights_machine_id.content is defined
+        fail_msg: "{{ inventory_hostname }} has no /etc/insights-client/machine-id: register it with Insights first."
+        quiet: true
+
+    - name: Gather the serial number
+      ansible.builtin.setup:
+        gather_subset: [hardware]
+        filter: [ansible_product_serial]
+
+    # API calls carry a bearer token or API key in a header, which Ansible
+    # does not mask, so they are no_log and the asserts report errors.
+    - name: Get a Red Hat API token
+      ansible.builtin.include_tasks: tasks/redhat-api-token.yml
+
+    - name: Wait for the VM in Insights inventory
+      ansible.builtin.uri:
+        url: "{{ rh_api_url }}/inventory/v1/hosts?insights_id={{ insights_machine_id.content | b64decode | trim }}"
+        headers: "{{ rh_api_headers }}"
+      register: insights_host
+      delegate_to: localhost
+      become: false
+      until: insights_host.status == 200 and insights_host.json.results | length > 0
+      retries: "{{ insights_inventory_wait_retries }}"
+      delay: 20
+      failed_when: false
+      no_log: true
+
+    - name: Check the VM was found in Insights inventory
+      ansible.builtin.assert:
+        that: insights_host.status == 200 and insights_host.json.results | length > 0
+        fail_msg: >-
+          {{ 'Red Hat API refused the service account: add the Inventory Hosts viewer role.'
+             if insights_host.status in [401, 403] else
+             inventory_hostname ~ ' is not in Insights inventory (HTTP ' ~ insights_host.status ~ ').' }}
+        quiet: true
+
+    - name: Remember the Insights inventory ID
+      ansible.builtin.set_fact:
+        insights_inventory_id: "{{ insights_host.json.results[0].id }}"
+
+    - name: Refresh the Red Hat API token
+      ansible.builtin.include_tasks: tasks/redhat-api-token.yml
+
+    # The vulnerability service answers 404 for a host it has not evaluated.
+    - name: Wait until Insights has evaluated the VM for vulnerabilities
+      ansible.builtin.uri:
+        url: "{{ rh_api_url }}/vulnerability/v1/systems/{{ insights_inventory_id }}/cves?limit=1"
+        headers: "{{ rh_api_headers }}"
+      register: insights_evaluated
+      delegate_to: localhost
+      become: false
+      until: insights_evaluated.status != 404
+      retries: "{{ insights_evaluation_wait_retries }}"
+      delay: 20
+      failed_when: false
+      no_log: true
+
+    - name: Check the vulnerability evaluation is available
+      ansible.builtin.assert:
+        that: insights_evaluated.status == 200
+        fail_msg: >-
+          {{ 'Insights has not evaluated ' ~ inventory_hostname ~ ' yet: run this playbook again later.'
+             if insights_evaluated.status == 404 else
+             'Red Hat API refused the service account: add the Vulnerability viewer role.'
+             if insights_evaluated.status in [401, 403] else
+             'Vulnerability API failed: HTTP ' ~ insights_evaluated.status }}
+        quiet: true
+
+    # --- List the CVEs ------------------------------------------------------
+
+    - name: Refresh the Red Hat API token
+      ansible.builtin.include_tasks: tasks/redhat-api-token.yml
+
+    - name: List the CVEs of the VM
+      ansible.builtin.uri:
+        url: >-
+          {{ rh_api_url }}/vulnerability/v1/systems/{{ insights_inventory_id }}/cves?limit={{
+          insights_cve_page_size }}&offset={{ item }}{{ ('&' ~ insights_cve_filter) if insights_cve_filter else '' }}
+        headers: "{{ rh_api_headers }}"
+      register: insights_cve_pages
+      loop: "{{ range(0, page_count | int * insights_cve_page_size, insights_cve_page_size) | list }}"
+      vars:
+        # meta.total_items of the probe call, without the filter, is an
+        # upper bound for the number of pages.
+        page_count: "{{ [((insights_evaluated.json.meta.total_items | int) / insights_cve_page_size) | round(0, 'ceil') | int, 1] | max }}"
+      delegate_to: localhost
+      become: false
+      failed_when: false
+      no_log: true
+
+    - name: Check the CVE list was read
+      ansible.builtin.assert:
+        that: insights_cve_pages.results | rejectattr('status', 'eq', 200) | list | length == 0
+        fail_msg: >-
+          Listing CVEs failed: HTTP {{ insights_cve_pages.results | map(attribute='status') | reject('eq', 200) | unique | join(', ') }}
+        quiet: true
+
+    - name: Collect the CVEs
+      ansible.builtin.set_fact:
+        insights_cves: >-
+          {{ insights_cve_pages.results | map(attribute='json') | map(attribute='data') | flatten
+             | map(attribute='id') | unique | sort }}
+        insights_cve_details: >-
+          {{ dict(insights_cve_pages.results | map(attribute='json') | map(attribute='data') | flatten
+             | map(attribute='id')
+             | zip(insights_cve_pages.results | map(attribute='json') | map(attribute='data') | flatten
+                   | map(attribute='attributes'))) }}
+
+    # --- ServiceNow ---------------------------------------------------------
+
+    - name: Look up the CMDB CI by serial number
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_api }}/{{ snow_cmdb_table }}?sysparm_limit=1&sysparm_fields=sys_id,name&sysparm_query={{
+          ('serial_number=' ~ ansible_facts['product_serial']) | urlencode }}
+        headers: "{{ snow_headers }}"
+      register: snow_ci
+      delegate_to: localhost
+      become: false
+      failed_when: false
+      no_log: true
+
+    - name: Check the CI exists
+      ansible.builtin.assert:
+        that: snow_ci.status == 200 and snow_ci.json.result | length > 0
+        fail_msg: >-
+          {{ 'ServiceNow rejected the API key (check the key and the API Access Policy).'
+             if snow_ci.status == 401 else
+             'The API key has no read access to ' ~ snow_cmdb_table ~ '.'
+             if snow_ci.status == 403 else
+             'No ' ~ snow_cmdb_table ~ ' CI with serial ' ~ ansible_facts['product_serial']
+             ~ ': run register-cmdb-ci.yml first.' if snow_ci.status == 200 else
+             'CMDB lookup failed: HTTP ' ~ snow_ci.status }}
+        quiet: true
+
+    - name: Look up the vulnerability records of the CVEs
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_api }}/{{ snow_cve_table }}?sysparm_limit={{ snow_query_batch }}&sysparm_fields=sys_id,id&sysparm_query={{
+          ('idIN' ~ item | join(',')) | urlencode }}
+        headers: "{{ snow_headers }}"
+      register: snow_cve_lookup
+      loop: "{{ insights_cves | batch(snow_query_batch) | list }}"
+      delegate_to: localhost
+      become: false
+      failed_when: false
+      no_log: true
+
+    - name: Create missing vulnerability records
+      ansible.builtin.uri:
+        url: "{{ snow_api }}/{{ snow_cve_table }}?sysparm_fields=sys_id,id"
+        method: POST
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          id: "{{ item }}"
+          summary: "{{ insights_cve_details[item].description | default(insights_cve_details[item].synopsis) | default(item) | truncate(4000) }}"
+        status_code: 201
+      register: snow_cve_created
+      loop: "{{ insights_cves | difference(snow_cve_found | map(attribute='id')) }}"
+      vars:
+        snow_cve_found: "{{ snow_cve_lookup.results | selectattr('status', 'eq', 200) | map(attribute='json') | map(attribute='result') | flatten }}"
+      when: snow_create_missing_cves | bool
+      delegate_to: localhost
+      become: false
+      failed_when: false
+      no_log: true
+
+    - name: Map CVE ids to vulnerability records
+      ansible.builtin.set_fact:
+        snow_cve_ids: >-
+          {{ dict(snow_cve_records | map(attribute='id') | zip(snow_cve_records | map(attribute='sys_id'))) }}
+      vars:
+        snow_cve_records: >-
+          {{ (snow_cve_lookup.results | selectattr('status', 'eq', 200) | map(attribute='json') | map(attribute='result') | flatten)
+             + (snow_cve_created.results | default([]) | selectattr('status', 'defined') | selectattr('status', 'eq', 201)
+                | map(attribute='json') | map(attribute='result') | list) }}
+
+    - name: Check the vulnerability record lookups
+      ansible.builtin.assert:
+        that:
+          - snow_cve_lookup.results | rejectattr('status', 'eq', 200) | list | length == 0
+          - snow_cve_created.results | default([]) | selectattr('status', 'defined') | rejectattr('status', 'eq', 201) | list | length == 0
+        fail_msg: >-
+          Reading or creating {{ snow_cve_table }} records failed: HTTP
+          {{ (snow_cve_lookup.results + snow_cve_created.results | default([])) | selectattr('status', 'defined')
+             | map(attribute='status') | reject('in', [200, 201]) | unique | join(', ') }}
+        quiet: true
+
+    - name: List the vulnerable items that already exist for the CI
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_api }}/{{ snow_vi_table }}?sysparm_limit=10000&sysparm_exclude_reference_link=true&sysparm_fields=sys_id,vulnerability&sysparm_query={{
+          ('cmdb_ci=' ~ snow_ci.json.result[0].sys_id) | urlencode }}
+        headers: "{{ snow_headers }}"
+      register: snow_existing_vis
+      delegate_to: localhost
+      become: false
+      failed_when: false
+      no_log: true
+
+    - name: Check the existing vulnerable items were read
+      ansible.builtin.assert:
+        that: snow_existing_vis.status == 200
+        fail_msg: "Reading {{ snow_vi_table }} failed: HTTP {{ snow_existing_vis.status }} (does the API key's user have a Vulnerability Response role?)"
+        quiet: true
+
+    - name: Create the missing vulnerable items
+      ansible.builtin.uri:
+        url: "{{ snow_api }}/{{ snow_vi_table }}?sysparm_fields=sys_id,number"
+        method: POST
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          cmdb_ci: "{{ snow_ci.json.result[0].sys_id }}"
+          vulnerability: "{{ snow_cve_ids[item] }}"
+          work_notes: >-
+            Reported by Red Hat Insights for {{ inventory_hostname }}
+            (impact {{ insights_cve_details[item].impact | default('unknown') }},
+            CVSS v3 {{ insights_cve_details[item].cvss3_score | default('n/a', true) }},
+            fix available: {{ insights_cve_details[item].advisory_available | default('unknown') }}).
+      register: snow_vi_created
+      loop: "{{ snow_cve_ids.keys() | difference(snow_cve_ids_with_vi) | sort }}"
+      vars:
+        snow_existing_vulns: "{{ snow_existing_vis.json.result | map(attribute='vulnerability') | list }}"
+        snow_cve_ids_with_vi: >-
+          {{ snow_cve_ids | dict2items | selectattr('value', 'in', snow_existing_vulns) | map(attribute='key') | list }}
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+    - name: Report the result
+      ansible.builtin.assert:
+        that: vi_failed | length == 0
+        fail_msg: >-
+          {{ vi_failed | length }} vulnerable item(s) could not be created
+          (HTTP {{ vi_failed | map(attribute='status') | unique | join(', ') }}):
+          {{ vi_failed | map(attribute='item') | join(', ') }}
+        success_msg: >-
+          {{ inventory_hostname }}: {{ insights_cves | length }} CVEs in Insights,
+          {{ vi_created | length }} vulnerable items created,
+          {{ snow_cve_ids | length - vi_created | length }} already existed,
+          {{ cves_skipped | length }} skipped (no {{ snow_cve_table }} record){{
+          (': ' ~ cves_skipped | join(', ')) if cves_skipped else '' }}.
+      vars:
+        vi_failed: "{{ snow_vi_created.results | rejectattr('status', 'eq', 201) | list }}"
+        vi_created: "{{ snow_vi_created.results | selectattr('status', 'eq', 201) | list }}"
+        cves_skipped: "{{ insights_cves | difference(snow_cve_ids.keys()) }}"
