@@ -2,6 +2,9 @@
 # Create or update a server configuration item (cmdb_ci_server)
 # in the ServiceNow CMDB for each VM in cmdb_target.
 #
+# Then links the CI to the CIs in snow_cmdb_relations (cmdb_rel_ci), by
+# default as child of the service instance "Salary System (Most Critical)".
+#
 # Imported at the end of provision-vm.yml (cmdb_target defaults to the
 # new_vms group it builds). Can also run on its own against VMs that are in
 # an AAP inventory: set cmdb_target to a host or group name.
@@ -12,7 +15,8 @@
 #   - Credential: Machine (the facts come from the VM, dmidecode needs sudo)
 # The API key's user needs read/write access to cmdb_ci_server. Access to a
 # parent table does not cover its child classes, so the CI is created in
-# cmdb_ci_server itself, not cmdb_ci_linux_server. Set snow_cmdb_register: false to skip this playbook.
+# cmdb_ci_server itself, not cmdb_ci_linux_server. The relationships need
+# read/create on cmdb_rel_ci. Set snow_cmdb_register: false to skip this playbook.
 #
 # The CI is matched on serial_number: OpenShift Virtualization stores the
 # SMBIOS serial on the VirtualMachine, so it survives restarts, and a VM
@@ -44,6 +48,13 @@
     # Scripted REST API that builds relations can take longer than the
     # uri module's default of 30.
     snow_cmdb_timeout: 120
+    # Relationships created for the CI in cmdb_rel_ci, with the CI as child.
+    # Existing ones are left alone. Needs read/create on cmdb_rel_ci.
+    # [] = no relationships.
+    snow_cmdb_relations:
+      - parent: c69d3c5be8094b50dd26f07907a9fb6c   # Salary System (Most Critical), service instance
+        type: 1a9cb166f1571100a92eb60da2bce5c5     # Depends on::Used by
+    snow_rel_url: "{{ snow_host }}/api/now/table/cmdb_rel_ci"
     # Reference fields (manufacturer -> core_company, model_id -> cmdb_model)
     # are sent by name and resolved by ServiceNow; a name with no matching or
     # readable record leaves the field empty. false leaves them out.
@@ -167,9 +178,17 @@
       failed_when: false
       no_log: true
 
-    # Both messages are templated whatever the outcome, so everything taken
-    # from the response has a default: a Scripted REST API need not answer
-    # like the Table API.
+    # Everything taken from the response has a default: a Scripted REST API
+    # need not answer like the Table API.
+    - name: Remember the sys_id of the CI
+      ansible.builtin.set_fact:
+        cmdb_ci_sys_id: >-
+          {{ cmdb_result.sys_id if (cmdb_result is mapping and cmdb_result.sys_id is defined)
+             else cmdb_existing.sys_id | default('') }}
+      vars:
+        cmdb_result: "{{ (cmdb_write.json | default({})).result | default({}) }}"
+
+    # Both messages are templated whatever the outcome.
     - name: Report the CI
       ansible.builtin.assert:
         that: cmdb_write.status in [200, 201]
@@ -185,12 +204,80 @@
         success_msg: >-
           {{ 'Updated' if cmdb_existing else 'Created' }} CI {{ inventory_hostname }}
           (serial {{ cmdb_ci_payload.serial_number }}) via {{ cmdb_target_desc }}:
-          {{ (snow_host ~ '/nav_to.do?uri=' ~ snow_cmdb_table ~ '.do?sys_id=' ~ cmdb_sys_id) if cmdb_sys_id else cmdb_response }}
+          {{ (snow_host ~ '/nav_to.do?uri=' ~ snow_cmdb_table ~ '.do?sys_id=' ~ cmdb_ci_sys_id) if cmdb_ci_sys_id else cmdb_response }}
       vars:
         cmdb_target_desc: "{{ snow_cmdb_endpoint or snow_cmdb_table }}"
-        cmdb_result: "{{ (cmdb_write.json | default({})).result | default({}) }}"
-        cmdb_sys_id: >-
-          {{ cmdb_result.sys_id if (cmdb_result is mapping and cmdb_result.sys_id is defined)
-             else cmdb_existing.sys_id | default('') }}
         cmdb_response: >-
           {{ (cmdb_write.json | default(cmdb_write.content | default(cmdb_write.msg | default(''))) | string)[:500] }}
+
+    # --- Relationships (cmdb_rel_ci) ---------------------------------------
+
+    - name: Check the CI sys_id is known for the relationships
+      ansible.builtin.assert:
+        that: cmdb_ci_sys_id | length > 0
+        fail_msg: >-
+          The response of {{ snow_cmdb_endpoint or snow_cmdb_table }} has no sys_id, so the
+          relationships cannot be created (set snow_cmdb_relations: [] to skip them).
+        quiet: true
+      when: snow_cmdb_relations | length > 0
+
+    - name: Look up the relationships that already exist
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_rel_url }}?sysparm_limit=1&sysparm_fields=sys_id&sysparm_query={{
+          ('parent=' ~ item.parent ~ '^child=' ~ cmdb_ci_sys_id ~ '^type=' ~ item.type) | urlencode }}
+        headers: "{{ snow_headers }}"
+      register: cmdb_rel_lookup
+      loop: "{{ snow_cmdb_relations }}"
+      delegate_to: localhost
+      become: false
+      failed_when: false
+      no_log: true
+
+    - name: Check the relationship lookups
+      ansible.builtin.assert:
+        that: cmdb_rel_lookup.results | rejectattr('status', 'eq', 200) | list | length == 0
+        fail_msg: >-
+          Reading cmdb_rel_ci failed: HTTP {{ cmdb_rel_lookup.results | map(attribute='status') | reject('eq', 200) | unique | join(', ') }}
+          {{ '(the API key needs read access to cmdb_rel_ci)'
+             if 403 in cmdb_rel_lookup.results | map(attribute='status') else '' }}
+        quiet: true
+      when: snow_cmdb_relations | length > 0
+
+    - name: Create the missing relationships
+      ansible.builtin.uri:
+        url: "{{ snow_rel_url }}?sysparm_fields=sys_id"
+        method: POST
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          parent: "{{ item.item.parent }}"
+          child: "{{ cmdb_ci_sys_id }}"
+          type: "{{ item.item.type }}"
+      register: cmdb_rel_create
+      loop: "{{ cmdb_rel_lookup.results | selectattr('json.result', 'equalto', []) | list }}"
+      loop_control:
+        label: "{{ item.item.parent }}"
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+    - name: Report the relationships
+      ansible.builtin.assert:
+        that: rel_failed | length == 0
+        fail_msg: >-
+          {{ rel_failed | length }} relationship(s) could not be created: HTTP
+          {{ rel_failed | map(attribute='status') | unique | join(', ') }}
+          {{ '(the API key needs create access to cmdb_rel_ci)'
+             if 403 in rel_failed | map(attribute='status') else '' }}
+          {{ (rel_failed | map(attribute='json') | map(attribute='error') | first | default({}) | to_json)[:300]
+             if rel_failed | selectattr('json', 'defined') | list else '' }}
+        success_msg: >-
+          Relationships of {{ inventory_hostname }}: {{ rel_created | length }} created,
+          {{ snow_cmdb_relations | length - cmdb_rel_create.results | length }} already existed.
+      vars:
+        rel_failed: "{{ cmdb_rel_create.results | rejectattr('status', 'eq', 201) | list }}"
+        rel_created: "{{ cmdb_rel_create.results | selectattr('status', 'eq', 201) | list }}"
+      when: snow_cmdb_relations | length > 0

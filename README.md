@@ -162,6 +162,16 @@ CPU vendor/type/count/cores, `virtual: true`. Empty values are not sent.
 - Needs the ServiceNow credential (API key; the key's user needs write access
   to `cmdb_ci_server`). The CI goes into `cmdb_ci_server` itself: access to a
   parent table does not cover child classes such as `cmdb_ci_linux_server`.
+- Afterwards it links the CI to each entry of `snow_cmdb_relations` in
+  `cmdb_rel_ci`, with the CI as child. Default: parent "Salary System (Most
+  Critical)" (`c69d3c5be8094b50dd26f07907a9fb6c`), type "Depends on::Used by"
+  (`1a9cb166f1571100a92eb60da2bce5c5`); the business application and offering
+  behind that service instance then show up as L2 relations. Existing
+  relationships are left alone; needs read/create on `cmdb_rel_ci`;
+  `snow_cmdb_relations: []` skips it.
+- `cmdb_serial_number` matches/updates an existing CI by that serial instead of
+  the VM's own; `snow_cmdb_endpoint` posts the payload to a Scripted REST API
+  instead of the Table API (`snow_cmdb_timeout`, default 120 s).
 - `snow_cmdb_register: false` skips it.
 - Standalone, for VMs already in an AAP inventory: a job template for
   `register-cmdb-ci.yml` with the Machine and ServiceNow credentials and
