@@ -192,8 +192,8 @@
         wait: true
       loop: "{{ aap_inventory_source_ids | default([]) }}"
 
-# - name: Register the new VM in the ServiceNow CMDB
-#   ansible.builtin.import_playbook: register-cmdb-ci.yml
+- name: Register the new VM in the ServiceNow CMDB
+  ansible.builtin.import_playbook: register-cmdb-ci.yml
 
 # # Waits for the first Insights vulnerability evaluation (usually a few minutes).
 # - name: Create ServiceNow vulnerable items for the VM's Insights CVEs
