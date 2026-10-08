@@ -156,6 +156,9 @@
           state: present
           remediation: present
           autoupdate: true
+        # System purpose; overrides what the activation key sets.
+        rhc_syspurpose:
+          service_level_agreement: "{{ vm_service_level | default('Standard') }}"
 
     # The rhc role only registers when "insights-client --status" says "NOT"
     # or "unregistered". On a never-registered RHEL 9.8 host
