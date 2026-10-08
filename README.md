@@ -15,7 +15,7 @@ charts/vulnerable-nginx/              chart of that release, extracted from the 
 provision-vm.yml                      create a RHEL VM on OpenShift Virtualization, register it with console.redhat.com
 aap/credential-type-activation-key.yml  custom AAP credential type for the RHSM activation key
 resolve-vulnerable-item.yml           set a ServiceNow vulnerable item to Resolved
-resolve-remediation-task.yml          resolve a remediation task's vulnerable items whose CVE was fixed
+resolve-remediation-task.yml          resolve the vulnerable items ServiceNow sent (imported by cve-remediation.yaml)
 register-cmdb-ci.yml                  create/update the VM's cmdb_ci_server CI (run at the end of provision-vm.yml)
 sync-insights-cves.yml                ServiceNow vulnerable item per Insights CVE of the VM (run after register-cmdb-ci.yml)
 tasks/redhat-api-token.yml            console.redhat.com token for the service account
@@ -149,30 +149,44 @@ is already Resolved is left alone.
 | `snow_vi_resolved_state` | `Resolved` | State label to set (label, not number) |
 | `snow_vi_work_note` | AAP job reference | Work note added with the change |
 
-## Resolving the fixed items of a remediation task (`resolve-remediation-task.yml`)
+## Resolving the vulnerable items of a remediation task (`resolve-remediation-task.yml`)
 
-Reads the `sn_vul_vulnerable_item` records whose sys_ids ServiceNow sends when
-a remediation task is approved (in batches of 100), matches each item's CVE
-(`vulnerability.id`) against `fixed_cves`, and sets the matching items to
-`Resolved` with a work note. Items with other CVEs, and items that are already
-Resolved, are left alone. It stops before changing anything when a sys_id is
-not a readable vulnerable item, and fails when ServiceNow kept the old state
-of an item (business rule or ACL). The final task reports how many items
-matched, which ones were resolved, and which fixed CVEs are not among them.
+ServiceNow launches the remediation job template (`cve-remediation.yaml`) when
+a remediation task is approved, with the task's vulnerable items as
+`vulnerable_item_sys_id` (comma-separated sys_ids). After the remediation plays,
+the job checks that the remediation ran on at least one host and failed on none,
+then imports `resolve-remediation-task.yml`, which sets those vulnerable items
+to `Resolved` with a work note. A failed or empty remediation leaves them open.
+Without `vulnerable_item_sys_id` (a manual run) the ServiceNow part is skipped.
 
-Same ServiceNow access and credential as `resolve-vulnerable-item.yml`. Pass the
-variables as extra vars, for example:
+The playbook reads the items in batches of 100, stops before changing anything
+when a sys_id is not a readable vulnerable item, skips items that are already
+Resolved, and fails when ServiceNow kept the old state of an item (business
+rule or ACL). With `fixed_cves`, only the items whose CVE (`vulnerability.id`)
+is in that list are resolved.
+
+Remediation job template:
+- Credentials: Machine, plus the "ServiceNow" credential (SN_HOST/SN_API_KEY).
+- Extra variables: "Prompt on launch", so the launch API accepts
+  `vulnerable_item_sys_id`.
+- ServiceNow access: the API Access Policy must cover the Table API resources
+  `/now/table/{tableName}` (GET) and `/now/table/{tableName}/{sys_id}` (PATCH)
+  for `sn_vul_vulnerable_item`, and the key's user needs write access to it
+  (e.g. `sn_vul.remediation_owner`).
+
+To run it on its own, use a job template with the ServiceNow credential and the
+inventory with `localhost`:
 
 ```yaml
-vulnerable_item_sys_ids: [0039af5d47bb8b105f8e370cd36d43a7, ...]
+vulnerable_item_sys_id: ae292f5d47bb8b105f8e370cd36d4365,66292f5d47bb8b105f8e370cd36d436a
 cmdb_ci_sys_id: b529e75d47bb8b105f8e370cd36d4331   # optional
-fixed_cves: [CVE-2025-71116, CVE-2025-71147, CVE-2026-0799]
+fixed_cves: [CVE-2025-71116, CVE-2025-71147]        # optional
 ```
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `vulnerable_item_sys_ids` | required | sys_ids of the vulnerable items (list, or comma-separated string) |
-| `fixed_cves` | required | CVE ids the remediation fixed (list, or comma-separated string) |
+| `vulnerable_item_sys_id` | required | sys_ids of the vulnerable items (comma-separated, or a list); `vulnerable_item_sys_ids` also works |
+| `fixed_cves` | empty | Only resolve items with these CVEs (list, or comma-separated) |
 | `cmdb_ci_sys_id` | empty | Only resolve items of this CI |
 | `snow_vi_resolved_state` | `Resolved` | State label to set (label, not number) |
 

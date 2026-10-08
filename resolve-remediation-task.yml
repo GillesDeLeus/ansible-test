@@ -1,14 +1,19 @@
 ---
-# Resolve the vulnerable items of a ServiceNow remediation task whose CVE is
-# in a list of CVEs the remediation fixed. Items with other CVEs are left alone.
+# Resolve the vulnerable items of a ServiceNow remediation task. With
+# fixed_cves, only the items whose CVE is in that list; without it, all of them.
+#
+# Imported at the end of cve-remediation.yaml, so the job ServiceNow launches
+# resolves the items it was sent once the remediation succeeded. Can also run
+# on its own.
 #
 # Job template requirements (see README):
 #   - Credential: custom "ServiceNow" (aap/credential-type-servicenow.yml)
 #     -> SN_HOST / SN_API_KEY env vars (REST API key, sent as x-sn-apikey)
 #   - Extra vars:
-#       vulnerable_item_sys_ids: sys_ids of the task's vulnerable items, as
-#         sent by ServiceNow when the task is approved (list or comma-separated)
-#       fixed_cves: list of CVE ids (or a comma-separated string)
+#       vulnerable_item_sys_id (or vulnerable_item_sys_ids): sys_ids of the
+#         task's vulnerable items, as sent by ServiceNow when the task is
+#         approved (comma-separated string or list)
+#       fixed_cves: optional, list of CVE ids (or a comma-separated string)
 #       cmdb_ci_sys_id: optional, only items of this CI
 # Same ServiceNow access as resolve-vulnerable-item.yml: write access to
 # sn_vul_vulnerable_item, plus read access to the vulnerability records
@@ -31,15 +36,18 @@
     snow_vi_resolved_state: Resolved
     snow_vi_work_note: >-
       Remediated by Ansible Automation Platform (job {{ tower_job_id | default('n/a') }}):
-      {{ item.cve }} fixed.
+      {{ item.cve or 'vulnerability' }} {{ 'fixed' if fixed_cve_list else 'remediated' }}.
     # sys_ids per lookup call: 100 keeps the URL around 3.5 KB.
     snow_query_batch: 100
     cmdb_ci_sys_id: ""
     # Lists or comma/space separated strings; sys_ids lower case, CVEs upper case.
+    # ServiceNow sends vulnerable_item_sys_id; the plural is kept for manual runs.
+    vi_sys_id_input: "{{ vulnerable_item_sys_ids | default(vulnerable_item_sys_id | default([])) }}"
     vi_sys_id_list: >-
-      {{ (vulnerable_item_sys_ids if vulnerable_item_sys_ids is not string
-          else vulnerable_item_sys_ids | split(',') | map('split') | flatten)
+      {{ (vi_sys_id_input if vi_sys_id_input is not string
+          else vi_sys_id_input | split(',') | map('split') | flatten)
          | map('trim') | reject('eq', '') | map('lower') | unique | list }}
+    fixed_cves: []
     fixed_cve_list: >-
       {{ (fixed_cves if fixed_cves is not string else fixed_cves | split(',') | map('split') | flatten)
          | map('trim') | reject('eq', '') | map('upper') | unique | list }}
@@ -48,15 +56,14 @@
     - name: Check required variables
       ansible.builtin.assert:
         that:
-          - vulnerable_item_sys_ids is defined and vi_sys_id_list | length > 0
+          - vi_sys_id_list | length > 0
           - vi_sys_id_list | reject('match', '^[0-9a-f]{32}$') | list | length == 0
           - cmdb_ci_sys_id | length == 0 or cmdb_ci_sys_id is match('^[0-9a-f]{32}$')
-          - fixed_cves is defined and fixed_cve_list | length > 0
           - snow_host | length > 0
           - snow_api_key | length > 0
         fail_msg: >-
-          Set vulnerable_item_sys_ids (sys_ids of 32 hex characters), fixed_cves (CVE ids),
-          optionally cmdb_ci_sys_id, and attach the ServiceNow credential.
+          Set vulnerable_item_sys_id (comma-separated sys_ids of 32 hex characters),
+          optionally fixed_cves and cmdb_ci_sys_id, and attach the ServiceNow credential.
         quiet: true
 
     # The API key is a plain header, which Ansible does not mask, so the API
@@ -90,7 +97,9 @@
     - name: Match the items against the fixed CVEs
       ansible.builtin.set_fact:
         task_items: "{{ task_items_all }}"
-        fixed_items: "{{ task_items_all | selectattr('cve', 'in', fixed_cve_list) | list }}"
+        fixed_items: >-
+          {{ (task_items_all | selectattr('cve', 'in', fixed_cve_list) | list)
+             if fixed_cve_list else task_items_all }}
         vi_not_found: "{{ vi_sys_id_list | difference(vi_records | map(attribute='sys_id.value')) }}"
       vars:
         vi_records: "{{ snow_vis.results | map(attribute='json') | map(attribute='result') | flatten }}"
@@ -146,7 +155,8 @@
           a business rule, ACL or missing role kept the old state).
         success_msg: >-
           {{ task_items | length }} vulnerable items,
-          {{ fixed_items | length }} match the {{ fixed_cve_list | length }} fixed CVEs:
+          {{ (fixed_items | length ~ ' match the ' ~ fixed_cve_list | length ~ ' fixed CVEs:')
+             if fixed_cve_list else 'all to resolve:' }}
           {{ vi_resolved | length }} set to {{ snow_vi_resolved_state }}
           ({{ vi_resolved | map(attribute='item.number') | join(', ') or 'none' }}),
           {{ fixed_items | length - vi_updates.results | length }} already {{ snow_vi_resolved_state }}.
