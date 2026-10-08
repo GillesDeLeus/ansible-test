@@ -1,9 +1,9 @@
 ---
 # Create or update a server configuration item (cmdb_ci_server)
-# in the ServiceNow CMDB for each VM in cmdb_target.
-#
-# Then links the CI to the CIs in snow_cmdb_relations (cmdb_rel_ci), by
-# default as child of the service instance "Salary System (Most Critical)".
+# in the ServiceNow CMDB for each VM in cmdb_target, through the createCI
+# Scripted REST API (snow_cmdb_endpoint), which also builds the CI's
+# relationships. Set snow_cmdb_endpoint: "" to use the Table API instead, and
+# snow_cmdb_relations to have this playbook create relationships in cmdb_rel_ci.
 #
 # Imported at the end of provision-vm.yml (cmdb_target defaults to the
 # new_vms group it builds). Can also run on its own against VMs that are in
@@ -13,10 +13,13 @@
 #   - Credential: custom "ServiceNow" (aap/credential-type-servicenow.yml)
 #     -> SN_HOST / SN_API_KEY env vars
 #   - Credential: Machine (the facts come from the VM, dmidecode needs sudo)
-# The API key's user needs read/write access to cmdb_ci_server. Access to a
-# parent table does not cover its child classes, so the CI is created in
-# cmdb_ci_server itself, not cmdb_ci_linux_server. The relationships need
-# read/create on cmdb_rel_ci. Set snow_cmdb_register: false to skip this playbook.
+# The API key needs an API Access Policy for the createCI Scripted REST API
+# (POST) and read access to cmdb_ci_server through the Table API (lookup by
+# serial). With the Table API instead: read/write access to cmdb_ci_server.
+# Access to a parent table does not cover its child classes, so the CI is
+# created in cmdb_ci_server itself, not cmdb_ci_linux_server. Relationships
+# created by this playbook need read/create on cmdb_rel_ci.
+# Set snow_cmdb_register: false to skip this playbook.
 #
 # The CI is matched on serial_number: OpenShift Virtualization stores the
 # SMBIOS serial on the VirtualMachine, so it survives restarts, and a VM
@@ -39,21 +42,22 @@
     # Set it (e.g. on the job template) to update an existing demo CI that
     # already has its relations, such as SNDVTLNUX1234.
     cmdb_serial_number: ""
+    # Path of a Scripted REST API the payload is always POSTed to; it decides
+    # itself whether to create or update, and builds the relationships.
     # Empty = create/update through the Table API (POST, or PATCH when the CI
-    # exists). A path such as /api/denbv/azure_link_demo/create_ci = always
-    # POST the payload to that Scripted REST API, which decides itself whether
-    # to create or update.
-    snow_cmdb_endpoint: ""
+    # exists).
+    snow_cmdb_endpoint: /api/denbv/azure_link_demo/create_ci
     # Seconds to wait for ServiceNow to answer the create/update call. A
     # Scripted REST API that builds relations can take longer than the
     # uri module's default of 30.
     snow_cmdb_timeout: 120
-    # Relationships created for the CI in cmdb_rel_ci, with the CI as child.
-    # Existing ones are left alone. Needs read/create on cmdb_rel_ci.
-    # [] = no relationships.
-    snow_cmdb_relations:
-      - parent: c69d3c5be8094b50dd26f07907a9fb6c   # Salary System (Most Critical), service instance
-        type: 1a9cb166f1571100a92eb60da2bce5c5     # Depends on::Used by
+    # Relationships this playbook creates for the CI in cmdb_rel_ci, with the
+    # CI as child. Existing ones are left alone. Needs read/create on
+    # cmdb_rel_ci. [] = none, because createCI builds them. With the Table API,
+    # set for example:
+    #   - parent: c69d3c5be8094b50dd26f07907a9fb6c   # Salary System (Most Critical), service instance
+    #     type: 1a9cb166f1571100a92eb60da2bce5c5     # Depends on::Used by
+    snow_cmdb_relations: []
     snow_rel_url: "{{ snow_host }}/api/now/table/cmdb_rel_ci"
     # Reference fields (manufacturer -> core_company, model_id -> cmdb_model)
     # are sent by name and resolved by ServiceNow; a name with no matching or

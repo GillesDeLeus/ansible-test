@@ -16,7 +16,7 @@ provision-vm.yml                      create a RHEL VM on OpenShift Virtualizati
 aap/credential-type-activation-key.yml  custom AAP credential type for the RHSM activation key
 resolve-vulnerable-item.yml           set a ServiceNow vulnerable item to Resolved
 resolve-remediation-task.yml          resolve the vulnerable items ServiceNow sent (imported by cve-remediation.yaml)
-register-cmdb-ci.yml                  create/update the VM's cmdb_ci_server CI (run at the end of provision-vm.yml)
+register-cmdb-ci.yml                  create/update the VM's CI through createCI (run at the end of provision-vm.yml)
 sync-insights-cves.yml                ServiceNow vulnerable item per Insights CVE of the VM (run after register-cmdb-ci.yml)
 tasks/redhat-api-token.yml            console.redhat.com token for the service account
 aap/credential-type-redhat-service-account.yml  custom AAP credential type for the Red Hat service account
@@ -192,28 +192,34 @@ fixed_cves: [CVE-2025-71116, CVE-2025-71147]        # optional
 
 ## CMDB configuration item (`register-cmdb-ci.yml`)
 
-Runs at the end of `provision-vm.yml` and creates a `cmdb_ci_server` CI
-for the new VM through the Table API, or updates it when one with the same
-`serial_number` exists. OpenShift Virtualization keeps the SMBIOS serial on
-the VirtualMachine, so it survives restarts; a VM recreated under the same name
-gets a new serial and a new CI. Fields come from the VM's facts: name, serial,
-manufacturer/model (resolved by name, left empty when ServiceNow has no such
-record; `snow_cmdb_references: false` leaves them out), host name, OS and version, pod IP (the guest only sees 10.0.2.2), RAM,
-CPU vendor/type/count/cores, `virtual: true`. Empty values are not sent.
+Runs at the end of `provision-vm.yml` and POSTs a `cmdb_ci_server` payload
+for the new VM to the createCI Scripted REST API
+(`/api/denbv/azure_link_demo/create_ci`), which creates the CI or updates the
+one with the same `serial_number`, and builds its relationships.
+OpenShift Virtualization keeps the SMBIOS serial on the VirtualMachine, so it
+survives restarts; a VM recreated under the same name gets a new serial and a
+new CI. Fields come from the VM's facts: name, serial, manufacturer/model
+(resolved by name, left empty when ServiceNow has no such record;
+`snow_cmdb_references: false` leaves them out), host name, OS and version, pod
+IP (the guest only sees 10.0.2.2), RAM, CPU vendor/type/count/cores,
+`virtual: true`. Empty values are not sent.
 
-- Needs the ServiceNow credential (API key; the key's user needs write access
-  to `cmdb_ci_server`). The CI goes into `cmdb_ci_server` itself: access to a
-  parent table does not cover child classes such as `cmdb_ci_linux_server`.
-- Afterwards it links the CI to each entry of `snow_cmdb_relations` in
-  `cmdb_rel_ci`, with the CI as child. Default: parent "Salary System (Most
+- Needs the ServiceNow credential. The API key's API Access Policies must cover
+  the createCI API (POST) and the Table API GET on `cmdb_ci_server` (the
+  playbook looks the CI up by serial first, to report Created or Updated).
+- createCI can take a while because it builds relations: the call waits up to
+  `snow_cmdb_timeout` (default 120 s). On a timeout ServiceNow may still finish,
+  so check the CI before rerunning.
+- `snow_cmdb_endpoint: ""` uses the Table API instead (POST, or PATCH when the
+  CI exists; the key's user needs write access to `cmdb_ci_server`, and the CI
+  goes into `cmdb_ci_server` itself: access to a parent table does not cover
+  child classes such as `cmdb_ci_linux_server`). Relationships are then not
+  built for you: set `snow_cmdb_relations`, e.g. parent "Salary System (Most
   Critical)" (`c69d3c5be8094b50dd26f07907a9fb6c`), type "Depends on::Used by"
-  (`1a9cb166f1571100a92eb60da2bce5c5`); the business application and offering
-  behind that service instance then show up as L2 relations. Existing
-  relationships are left alone; needs read/create on `cmdb_rel_ci`;
-  `snow_cmdb_relations: []` skips it.
+  (`1a9cb166f1571100a92eb60da2bce5c5`), and the playbook creates the missing
+  ones in `cmdb_rel_ci` (needs read/create there). Default `[]`.
 - `cmdb_serial_number` matches/updates an existing CI by that serial instead of
-  the VM's own; `snow_cmdb_endpoint` posts the payload to a Scripted REST API
-  instead of the Table API (`snow_cmdb_timeout`, default 120 s).
+  the VM's own.
 - `snow_cmdb_register: false` skips it.
 - Standalone, for VMs already in an AAP inventory: a job template for
   `register-cmdb-ci.yml` with the Machine and ServiceNow credentials and
