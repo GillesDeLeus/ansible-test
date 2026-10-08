@@ -130,9 +130,9 @@
       loop: "{{ fixed_items | rejectattr('state', 'eq', snow_vi_resolved_state) | list }}"
       loop_control:
         label: "{{ item.number }} {{ item.cve }}"
-      changed_when: true
+      changed_when: vi_updates.status | default(0) == 200
       failed_when: false
-      no_log: true
+      no_log: false
 
     # Business rules or ACLs can silently keep the old state while the API
     # still answers 200, so check what was actually stored.
