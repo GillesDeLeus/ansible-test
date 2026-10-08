@@ -156,7 +156,10 @@ a remediation task is approved, with the task's vulnerable items as
 `vulnerable_item_sys_id` (comma-separated sys_ids). After the remediation plays,
 the job checks that the remediation ran on at least one host and failed on none,
 then imports `resolve-remediation-task.yml`, which sets those vulnerable items
-to `Resolved` with a work note. A failed or empty remediation leaves them open.
+to `Resolved` with a work note. With `remtask_sys_id` (the remediation task),
+it then sets the task to `Resolved` too, once every item sent is Resolved;
+the task is read before any item changes, so a wrong sys_id or missing access
+stops the job first. A failed or empty remediation leaves everything open.
 Without `vulnerable_item_sys_id` (a manual run) the ServiceNow part is skipped.
 
 The playbook reads the items in batches of 100, stops before changing anything
@@ -171,7 +174,9 @@ Remediation job template:
   `vulnerable_item_sys_id`.
 - ServiceNow access: the API Access Policy must cover the Table API resources
   `/now/table/{tableName}` (GET) and `/now/table/{tableName}/{sys_id}` (PATCH)
-  for `sn_vul_vulnerable_item`, and the key's user needs write access to it
+  for `sn_vul_vulnerable_item`, and `/now/table/{tableName}/{sys_id}` (GET and
+  PATCH) for the remediation task table (`sn_vul_vulnerability`) when
+  `remtask_sys_id` is sent. The key's user needs write access to both
   (e.g. `sn_vul.remediation_owner`).
 
 To run it on its own, use a job template with the ServiceNow credential and the
@@ -188,7 +193,10 @@ fixed_cves: [CVE-2025-71116, CVE-2025-71147]        # optional
 | `vulnerable_item_sys_id` | required | sys_ids of the vulnerable items (comma-separated, or a list); `vulnerable_item_sys_ids` also works |
 | `fixed_cves` | empty | Only resolve items with these CVEs (list, or comma-separated) |
 | `cmdb_ci_sys_id` | empty | Only resolve items of this CI |
-| `snow_vi_resolved_state` | `Resolved` | State label to set (label, not number) |
+| `remtask_sys_id` | empty | Remediation task to set to Resolved once all items are Resolved |
+| `snow_vi_resolved_state` | `Resolved` | State label to set on the items (label, not number) |
+| `snow_remtask_table` | `sn_vul_vulnerability` | Table of the remediation task |
+| `snow_remtask_resolved_state` | `Resolved` | State label to set on the task |
 
 ## CMDB configuration item (`register-cmdb-ci.yml`)
 

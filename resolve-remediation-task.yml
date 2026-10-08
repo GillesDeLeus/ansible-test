@@ -1,6 +1,8 @@
 ---
 # Resolve the vulnerable items of a ServiceNow remediation task. With
 # fixed_cves, only the items whose CVE is in that list; without it, all of them.
+# With remtask_sys_id, the remediation task itself is then set to Resolved too,
+# once every vulnerable item sent is Resolved.
 #
 # Imported at the end of cve-remediation.yaml, so the job ServiceNow launches
 # resolves the items it was sent once the remediation succeeded. Can also run
@@ -15,9 +17,11 @@
 #         approved (comma-separated string or list)
 #       fixed_cves: optional, list of CVE ids (or a comma-separated string)
 #       cmdb_ci_sys_id: optional, only items of this CI
+#       remtask_sys_id: optional, sys_id of the remediation task to resolve
 # Same ServiceNow access as resolve-vulnerable-item.yml: write access to
 # sn_vul_vulnerable_item, plus read access to the vulnerability records
-# (vulnerability.id is dot-walked).
+# (vulnerability.id is dot-walked). With remtask_sys_id also read/write on the
+# remediation task table (Table API GET/PATCH /now/table/{tableName}/{sys_id}).
 
 - name: Resolve the fixed vulnerable items of a remediation task
   hosts: localhost
@@ -48,6 +52,14 @@
           else vi_sys_id_input | split(',') | map('split') | flatten)
          | map('trim') | reject('eq', '') | map('lower') | unique | list }}
     fixed_cves: []
+    # Remediation task: read before any change, resolved at the end.
+    remtask_sys_id: ""
+    snow_remtask_table: sn_vul_vulnerability
+    snow_remtask_url: "{{ snow_host }}/api/now/table/{{ snow_remtask_table }}/{{ remtask_sys_id | trim | lower }}"
+    snow_remtask_resolved_state: Resolved
+    snow_remtask_work_note: >-
+      All {{ task_items | length }} vulnerable items resolved by Ansible Automation Platform
+      (job {{ tower_job_id | default('n/a') }}).
     fixed_cve_list: >-
       {{ (fixed_cves if fixed_cves is not string else fixed_cves | split(',') | map('split') | flatten)
          | map('trim') | reject('eq', '') | map('upper') | unique | list }}
@@ -59,15 +71,44 @@
           - vi_sys_id_list | length > 0
           - vi_sys_id_list | reject('match', '^[0-9a-f]{32}$') | list | length == 0
           - cmdb_ci_sys_id | length == 0 or cmdb_ci_sys_id is match('^[0-9a-f]{32}$')
+          - remtask_sys_id | trim | length == 0 or remtask_sys_id | trim | lower is match('^[0-9a-f]{32}$')
           - snow_host | length > 0
           - snow_api_key | length > 0
         fail_msg: >-
           Set vulnerable_item_sys_id (comma-separated sys_ids of 32 hex characters),
-          optionally fixed_cves and cmdb_ci_sys_id, and attach the ServiceNow credential.
+          optionally fixed_cves, cmdb_ci_sys_id and remtask_sys_id (32 hex characters),
+          and attach the ServiceNow credential.
         quiet: true
 
     # The API key is a plain header, which Ansible does not mask, so the API
     # calls are no_log and the asserts after them report errors instead.
+    # The task is read first, so a wrong sys_id or missing access stops the
+    # job before any vulnerable item changes.
+    - name: Read the remediation task
+      ansible.builtin.uri:
+        url: "{{ snow_remtask_url }}?sysparm_display_value=true&sysparm_fields=number,state"
+        headers: "{{ snow_headers }}"
+      register: remtask_before
+      when: remtask_sys_id | trim | length > 0
+      failed_when: false
+      no_log: true
+
+    - name: Check the remediation task was read
+      ansible.builtin.assert:
+        that: remtask_before.status == 200
+        fail_msg: >-
+          {{ 'No ' ~ snow_remtask_table ~ ' record with sys_id ' ~ remtask_sys_id
+             ~ ' (wrong sys_id, or the task is in another table: set snow_remtask_table).'
+             if remtask_before.status == 404 else
+             'ServiceNow ignored the API key for ' ~ snow_remtask_table
+             ~ ': the API Access Policy must cover the Table API GET/PATCH /now/table/{tableName}/{sys_id} for that table.'
+             if remtask_before.status == 401 else
+             'The API key has no read access to ' ~ snow_remtask_table ~ '.'
+             if remtask_before.status == 403 else
+             'Reading the remediation task failed: HTTP ' ~ remtask_before.status }}
+        quiet: true
+      when: remtask_before is not skipped
+
     - name: Read the vulnerable items
       ansible.builtin.uri:
         url: >-
@@ -141,7 +182,7 @@
         label: "{{ item.number }} {{ item.cve }}"
       changed_when: vi_updates.status | default(0) == 200
       failed_when: false
-      no_log: false
+      no_log: true
 
     # Business rules or ACLs can silently keep the old state while the API
     # still answers 200, so check what was actually stored.
@@ -167,3 +208,60 @@
              | selectattr('json.result.state', 'eq', snow_vi_resolved_state) | list }}
         vi_failed: "{{ vi_updates.results | difference(vi_resolved) }}"
         cves_missing: "{{ fixed_cve_list | difference(task_items | map(attribute='cve')) }}"
+
+    # --- Remediation task ---------------------------------------------------
+
+    # Only when every item sent is Resolved: with fixed_cves, items with other
+    # CVEs stay open and so does the task.
+    - name: Find the vulnerable items that are still open
+      ansible.builtin.set_fact:
+        vi_still_open: >-
+          {{ task_items | rejectattr('state', 'eq', snow_vi_resolved_state)
+             | rejectattr('sys_id', 'in', vi_updates.results | selectattr('status', 'eq', 200)
+                          | selectattr('json.result.state', 'eq', snow_vi_resolved_state)
+                          | map(attribute='item.sys_id') | list)
+             | list }}
+      when: remtask_before is not skipped
+
+    - name: Set the remediation task to {{ snow_remtask_resolved_state }}
+      ansible.builtin.uri:
+        url: "{{ snow_remtask_url }}?sysparm_input_display_value=true&sysparm_display_value=true&sysparm_fields=number,state"
+        method: PATCH
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          state: "{{ snow_remtask_resolved_state }}"
+          work_notes: "{{ snow_remtask_work_note }}"
+      register: remtask_after
+      when:
+        - remtask_before is not skipped
+        - vi_still_open | length == 0
+        - remtask_before.json.result.state != snow_remtask_resolved_state
+      changed_when: remtask_after.status | default(0) == 200
+      failed_when: false
+      no_log: true
+
+    # Read back, as for the items: ServiceNow can answer 200 and keep the state.
+    - name: Report the remediation task
+      ansible.builtin.assert:
+        that: remtask_after.status == 200 and remtask_after.json.result.state == snow_remtask_resolved_state
+        fail_msg: >-
+          {{ remtask_before.json.result.number }} was not resolved:
+          {{ ('HTTP ' ~ remtask_after.status ~ ' '
+              ~ ('(the API Access Policy must cover PATCH /now/table/{tableName}/{sys_id} for ' ~ snow_remtask_table ~ ')'
+                 if remtask_after.status == 401 else
+                 '(no write access to ' ~ snow_remtask_table ~ ')' if remtask_after.status == 403 else ''))
+             if remtask_after.status != 200 else
+             'still "' ~ remtask_after.json.result.state ~ '" (business rule, ACL, missing role, or "'
+             ~ snow_remtask_resolved_state ~ '" is not a state of this table: set snow_remtask_resolved_state)' }}
+        success_msg: "{{ remtask_after.json.result.number }} is now {{ snow_remtask_resolved_state }}."
+      when: remtask_after is not skipped
+
+    - name: Report a remediation task that was left alone
+      ansible.builtin.debug:
+        msg: >-
+          {{ remtask_before.json.result.number }}
+          {{ ('was already ' ~ snow_remtask_resolved_state ~ '.') if vi_still_open | length == 0 else
+             ('stays "' ~ remtask_before.json.result.state ~ '": ' ~ vi_still_open | length
+              ~ ' vulnerable item(s) still open (' ~ vi_still_open | map(attribute='number') | join(', ') | truncate(300) ~ ').') }}
+      when: remtask_before is not skipped and remtask_after is skipped
