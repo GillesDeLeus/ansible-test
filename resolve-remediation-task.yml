@@ -244,17 +244,27 @@
     # Read back, as for the items: ServiceNow can answer 200 and keep the state.
     - name: Report the remediation task
       ansible.builtin.assert:
-        that: remtask_after.status == 200 and remtask_after.json.result.state == snow_remtask_resolved_state
+        that: remtask_after.status == 200 and remtask_state == snow_remtask_resolved_state
         fail_msg: >-
-          {{ remtask_before.json.result.number }} was not resolved:
+          {{ remtask_number }} was not resolved:
           {{ ('HTTP ' ~ remtask_after.status ~ ' '
               ~ ('(the API Access Policy must cover PATCH /now/table/{tableName}/{sys_id} for ' ~ snow_remtask_table ~ ')'
                  if remtask_after.status == 401 else
-                 '(no write access to ' ~ snow_remtask_table ~ ')' if remtask_after.status == 403 else ''))
+                 '(no write access to ' ~ snow_remtask_table ~ ')' if remtask_after.status == 403 else '')
+              ~ ' ' ~ remtask_error)
              if remtask_after.status != 200 else
-             'still "' ~ remtask_after.json.result.state ~ '" (business rule, ACL, missing role, or "'
+             'still "' ~ remtask_state ~ '" (business rule, ACL, missing role, or "'
              ~ snow_remtask_resolved_state ~ '" is not a state of this table: set snow_remtask_resolved_state)' }}
-        success_msg: "{{ remtask_after.json.result.number }} is now {{ snow_remtask_resolved_state }}."
+        success_msg: "{{ remtask_number }} is now {{ snow_remtask_resolved_state }}."
+      vars:
+        # Both messages are templated whatever the outcome, and an error
+        # response has no result, so nothing here may assume one.
+        remtask_result: "{{ (remtask_after.json | default({})).result | default({}) }}"
+        remtask_state: "{{ remtask_result.state | default('') if remtask_result is mapping else '' }}"
+        remtask_number: "{{ remtask_before.json.result.number | default(remtask_sys_id) }}"
+        remtask_error: >-
+          {{ ((remtask_after.json | default({})).error | default({})).values() | select | join(': ')
+             | default(remtask_after.msg | default(''), true) | string | truncate(300) }}
       when: remtask_after is not skipped
 
     - name: Report a remediation task that was left alone
