@@ -48,7 +48,7 @@
         headers: "{{ snow_headers }}"
       register: vi_before
       failed_when: false
-      no_log: true
+      no_log: false
 
     - name: Check the vulnerable item was read
       ansible.builtin.assert:
