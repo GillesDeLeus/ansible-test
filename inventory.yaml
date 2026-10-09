@@ -1,0 +1,6 @@
+---
+# Release variables live in group_vars/all.yml.
+all:
+  hosts:
+    localhost:
+      ansible_connection: local

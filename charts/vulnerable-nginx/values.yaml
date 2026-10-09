@@ -1,0 +1,9 @@
+image:
+  pullPolicy: IfNotPresent
+  repository: nginx
+  tag: 1.20.0
+replicaCount: 1
+route:
+  enabled: true
+service:
+  port: 8080

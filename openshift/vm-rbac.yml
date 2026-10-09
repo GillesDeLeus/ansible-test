@@ -1,0 +1,71 @@
+---
+# Apply once as a cluster admin: oc apply -f openshift/vm-rbac.yml
+# Service account used by provision-vm.yml. It lives in the "aap" namespace and
+# can only manage VMs in "rhel-vms" (vm_namespace in the playbook).
+# Long-lived token for the AAP credential:
+#   oc get secret aap-vm-provisioner-token -n aap -o jsonpath='{.data.token}' | base64 -d
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rhel-vms
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aap-vm-provisioner
+  namespace: aap
+---
+# Non-expiring token, so the AAP credential does not need refreshing.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: aap-vm-provisioner-token
+  namespace: aap
+  annotations:
+    kubernetes.io/service-account.name: aap-vm-provisioner
+type: kubernetes.io/service-account-token
+---
+# "edit" aggregates kubevirt.io:edit and the CDI DataVolume permissions.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aap-vm-provisioner-edit
+  namespace: rhel-vms
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: edit
+subjects:
+  - kind: ServiceAccount
+    name: aap-vm-provisioner
+    namespace: aap
+---
+# Cloning the boot disk from a golden image DataSource needs datavolumes/source
+# in the source namespace. OpenShift Virtualization usually grants this to all
+# authenticated users already; this makes it explicit.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aap-vm-provisioner-clone
+  namespace: openshift-virtualization-os-images
+rules:
+  - apiGroups: [cdi.kubevirt.io]
+    resources: [datasources, dataimportcrons]
+    verbs: [get, list, watch]
+  - apiGroups: [cdi.kubevirt.io]
+    resources: [datavolumes/source]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aap-vm-provisioner-clone
+  namespace: openshift-virtualization-os-images
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: aap-vm-provisioner-clone
+subjects:
+  - kind: ServiceAccount
+    name: aap-vm-provisioner
+    namespace: aap

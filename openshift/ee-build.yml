@@ -1,0 +1,51 @@
+---
+# Builds the execution environment inside the cluster and stores it in the
+# OpenShift internal registry, so no external registry is needed.
+# Apply once: oc apply -f openshift/ee-build.yml   (replace the "aap" namespace)
+# Follow:     oc logs -f bc/ee-nginx-patch -n aap
+# Image for AAP: image-registry.openshift-image-registry.svc:5000/aap/ee-nginx-patch:latest
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: ee-nginx-patch
+  namespace: aap
+---
+apiVersion: build.openshift.io/v1
+kind: BuildConfig
+metadata:
+  name: ee-nginx-patch
+  namespace: aap
+spec:
+  runPolicy: Serial
+  source:
+    # ee-supported already ships kubernetes.core, redhat.rhel_system_roles,
+    # ansible.controller and the kubernetes Python client. This adds helm and
+    # kubevirt.core (public Galaxy, no token needed), so the project has no
+    # collections/requirements.yml and syncs without downloading anything.
+    # The last RUN fails the build if any collection the playbooks use is missing.
+    # Match the installed AAP version.
+    dockerfile: |
+      FROM registry.redhat.io/ansible-automation-platform-25/ee-supported-rhel9:latest
+      USER root
+      RUN arch=$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/') && \
+          curl -fsSL "https://mirror.openshift.com/pub/openshift-v4/clients/helm/latest/helm-linux-${arch}" -o /usr/local/bin/helm && \
+          chmod 0755 /usr/local/bin/helm && \
+          helm version
+      RUN ansible-galaxy collection install 'kubevirt.core:>=2.0.0,<3.0.0' \
+            -p /usr/share/ansible/collections --server https://galaxy.ansible.com
+      RUN ansible-galaxy collection list --format json | python3 -c 'import json, sys; \
+          have = {c for path in json.load(sys.stdin).values() for c in path}; \
+          need = {"kubernetes.core", "kubevirt.core", "redhat.rhel_system_roles", "ansible.controller"}; \
+          missing = sorted(need - have); \
+          print("missing collections:", missing) if missing else print("all collections present"); \
+          sys.exit(1 if missing else 0)'
+      USER 1000
+  strategy:
+    type: Docker
+    dockerStrategy: {}
+  output:
+    to:
+      kind: ImageStreamTag
+      name: ee-nginx-patch:latest
+  triggers:
+    - type: ConfigChange

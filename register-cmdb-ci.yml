@@ -1,0 +1,287 @@
+---
+# Create or update a server configuration item (cmdb_ci_server)
+# in the ServiceNow CMDB for each VM in cmdb_target, through the createCI
+# Scripted REST API (snow_cmdb_endpoint), which also builds the CI's
+# relationships. Set snow_cmdb_endpoint: "" to use the Table API instead, and
+# snow_cmdb_relations to have this playbook create relationships in cmdb_rel_ci.
+#
+# Imported at the end of provision-vm.yml (cmdb_target defaults to the
+# new_vms group it builds). Can also run on its own against VMs that are in
+# an AAP inventory: set cmdb_target to a host or group name.
+#
+# Job template requirements (see README):
+#   - Credential: custom "ServiceNow" (aap/credential-type-servicenow.yml)
+#     -> SN_HOST / SN_API_KEY env vars
+#   - Credential: Machine (the facts come from the VM, dmidecode needs sudo)
+# The API key needs an API Access Policy for the createCI Scripted REST API
+# (POST) and read access to cmdb_ci_server through the Table API (lookup by
+# serial). With the Table API instead: read/write access to cmdb_ci_server.
+# Access to a parent table does not cover its child classes, so the CI is
+# created in cmdb_ci_server itself, not cmdb_ci_linux_server. Relationships
+# created by this playbook need read/create on cmdb_rel_ci.
+# Set snow_cmdb_register: false to skip this playbook.
+#
+# The CI is matched on serial_number: OpenShift Virtualization stores the
+# SMBIOS serial on the VirtualMachine, so it survives restarts, and a VM
+# recreated under the same name is a new machine with a new CI.
+
+- name: Register the VMs in the ServiceNow CMDB
+  hosts: "{{ cmdb_target | default('new_vms') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    snow_host: "{{ lookup('ansible.builtin.env', 'SN_HOST') | trim | regex_replace('/+$', '') }}"
+    snow_api_key: "{{ lookup('ansible.builtin.env', 'SN_API_KEY') | trim }}"
+    snow_headers:
+      Accept: application/json
+      x-sn-apikey: "{{ snow_api_key }}"
+    snow_cmdb_table: cmdb_ci_server
+    snow_cmdb_url: "{{ snow_host }}/api/now/table/{{ snow_cmdb_table }}"
+    # Serial number used to match the CI. Empty = the VM's own SMBIOS serial.
+    # Set it (e.g. on the job template) to update an existing demo CI that
+    # already has its relations, such as SNDVTLNUX1234.
+    cmdb_serial_number: ""
+    # Path of a Scripted REST API the payload is always POSTed to; it decides
+    # itself whether to create or update, and builds the relationships.
+    # Empty = create/update through the Table API (POST, or PATCH when the CI
+    # exists).
+    snow_cmdb_endpoint: /api/denbv/azure_link_demo/create_ci
+    # Seconds to wait for ServiceNow to answer the create/update call. A
+    # Scripted REST API that builds relations can take longer than the
+    # uri module's default of 30.
+    snow_cmdb_timeout: 120
+    # Relationships this playbook creates for the CI in cmdb_rel_ci, with the
+    # CI as child. Existing ones are left alone. Needs read/create on
+    # cmdb_rel_ci. [] = none, because createCI builds them. With the Table API,
+    # set for example:
+    #   - parent: c69d3c5be8094b50dd26f07907a9fb6c   # Salary System (Most Critical), service instance
+    #     type: 1a9cb166f1571100a92eb60da2bce5c5     # Depends on::Used by
+    snow_cmdb_relations: []
+    snow_rel_url: "{{ snow_host }}/api/now/table/cmdb_rel_ci"
+    # Reference fields (manufacturer -> core_company, model_id -> cmdb_model)
+    # are sent by name and resolved by ServiceNow; a name with no matching or
+    # readable record leaves the field empty. false leaves them out.
+    snow_cmdb_references: true
+    snow_cmdb_manufacturer: "{{ ansible_facts['system_vendor'] }}"
+    snow_cmdb_model: "{{ ansible_facts['product_name'] }}"
+    snow_cmdb_comments: >-
+      Provisioned by Ansible Automation Platform{{ (' job ' ~ tower_job_id) if tower_job_id is defined else '' }}
+      on OpenShift Virtualization ({{ vm_namespace | default('rhel-vms') }}/{{ inventory_hostname }}).
+    # ip_address: the guest only sees the masquerade address (10.0.2.2); the
+    # pod IP in ansible_host is the address that reaches the VM.
+    cpu_vendors:
+      GenuineIntel: Intel
+      AuthenticAMD: AMD
+
+  tasks:
+    - name: Skip when CMDB registration is disabled
+      ansible.builtin.meta: end_play
+      when: not (snow_cmdb_register | default(true) | bool)
+
+    - name: Check the ServiceNow credential
+      ansible.builtin.assert:
+        that:
+          - snow_host | length > 0
+          - snow_api_key | length > 0
+        fail_msg: >-
+          Attach the ServiceNow credential to the job template, or set
+          snow_cmdb_register: false to skip CMDB registration.
+        quiet: true
+      run_once: true
+
+    - name: Gather hardware facts
+      ansible.builtin.setup:
+        gather_subset: [hardware, virtual, network]
+
+    # One expression, so numbers and booleans keep their type in the JSON.
+    # Empty values (no DNS domain, no CPU speed in a VM) are left out.
+    - name: Build the CI payload
+      ansible.builtin.set_fact:
+        cmdb_ci_payload: >-
+          {{ {
+               'name': inventory_hostname,
+               'serial_number': cmdb_serial_number | default('', true) or ansible_facts['product_serial'],
+               'manufacturer': snow_cmdb_manufacturer,
+               'model_id': snow_cmdb_model,
+               'comments': snow_cmdb_comments,
+               'host_name': ansible_facts['hostname'],
+               'os_domain': ansible_facts['domain'],
+               'dns_domain': ansible_facts['domain'],
+               'os': 'Linux Red Hat',
+               'os_version': 'Red Hat Enterprise Linux ' ~ ansible_facts['distribution_version'],
+               'os_service_pack': 'Update ' ~ (ansible_facts['distribution_version'].split('.') + ['0'])[1],
+               'ip_address': ansible_host | default(ansible_facts['default_ipv4']['address']),
+               'ram': ansible_facts['memtotal_mb'] | int,
+               'cpu_manufacturer': cpu_vendors[cpu_vendor] | default(cpu_vendor),
+               'cpu_type': cpu_model,
+               'cpu_speed': ((cpu_ghz | float) * 1000) | int if cpu_ghz else none,
+               'cpu_count': ansible_facts['processor_count'] | int,
+               'cpu_core_count': ansible_facts['processor_cores'] | int,
+               'virtual': true,
+             } | dict2items | rejectattr('value', 'in', ['', none, 'NA'])
+               | rejectattr('key', 'in', [] if snow_cmdb_references | bool else ['manufacturer', 'model_id'])
+               | items2dict }}
+      vars:
+        cpu_vendor: "{{ ansible_facts['processor'][1] | default('') }}"
+        cpu_model: "{{ ansible_facts['processor'][2] | default('') }}"
+        cpu_ghz: "{{ cpu_model | regex_search('@ *([0-9.]+) *GHz', '\\1') | default([], true) | first | default('') }}"
+
+    - name: Check the VM has a serial number
+      ansible.builtin.assert:
+        that: cmdb_ci_payload.serial_number is defined
+        fail_msg: "No SMBIOS serial number on {{ inventory_hostname }}: cannot match a CI."
+        quiet: true
+
+    # The API key is a plain header, which Ansible does not mask, so the API
+    # calls are no_log and the asserts after them report errors instead.
+    - name: Look up an existing CI by serial number
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_cmdb_url }}?sysparm_limit=1&sysparm_fields=sys_id,name&sysparm_query={{
+          ('serial_number=' ~ cmdb_ci_payload.serial_number) | urlencode }}
+        method: GET
+        headers: "{{ snow_headers }}"
+      register: cmdb_lookup
+      delegate_to: localhost
+      become: false
+      failed_when: false
+      no_log: true
+
+    - name: Check the lookup worked
+      ansible.builtin.assert:
+        that: cmdb_lookup.status == 200
+        fail_msg: >-
+          {{ 'ServiceNow rejected the API key (check the key and the API Access Policy).'
+             if cmdb_lookup.status == 401 else
+             'The API key has no read access to ' ~ snow_cmdb_table ~ '.'
+             if cmdb_lookup.status == 403 else
+             'CMDB lookup failed: HTTP ' ~ cmdb_lookup.status }}
+          {{ cmdb_lookup.json.error | default({}) | to_json if cmdb_lookup.status != 200 else '' }}
+        quiet: true
+
+    - name: Remember the existing CI
+      ansible.builtin.set_fact:
+        cmdb_existing: "{{ cmdb_lookup.json.result | first | default({}) }}"
+
+    - name: Create or update the CI
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_host ~ snow_cmdb_endpoint if snow_cmdb_endpoint else
+             snow_cmdb_url ~ (('/' ~ cmdb_existing.sys_id) if cmdb_existing else '')
+             ~ '?sysparm_input_display_value=true&sysparm_fields=sys_id,name' }}
+        method: "{{ 'PATCH' if cmdb_existing and not snow_cmdb_endpoint else 'POST' }}"
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body: "{{ cmdb_ci_payload }}"
+        timeout: "{{ snow_cmdb_timeout }}"
+      register: cmdb_write
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+    # Everything taken from the response has a default: a Scripted REST API
+    # need not answer like the Table API.
+    - name: Remember the sys_id of the CI
+      ansible.builtin.set_fact:
+        cmdb_ci_sys_id: >-
+          {{ cmdb_result.sys_id if (cmdb_result is mapping and cmdb_result.sys_id is defined)
+             else cmdb_existing.sys_id | default('') }}
+      vars:
+        cmdb_result: "{{ (cmdb_write.json | default({})).result | default({}) }}"
+
+    # Both messages are templated whatever the outcome.
+    - name: Report the CI
+      ansible.builtin.assert:
+        that: cmdb_write.status in [200, 201]
+        fail_msg: >-
+          Writing the CI for {{ inventory_hostname }} to {{ cmdb_target_desc }} failed: HTTP {{ cmdb_write.status }}
+          {{ '(no answer within ' ~ snow_cmdb_timeout ~ ' s: the endpoint is slow or hangs. ServiceNow may
+             still finish the change, so check the CI; raise snow_cmdb_timeout if it needs longer)'
+             if cmdb_write.status == -1 and 'timed out' in cmdb_write.msg | default('') else
+             '(no connection to ServiceNow)' if cmdb_write.status == -1 else
+             '(no write access, or a field in the payload is not allowed)' if cmdb_write.status == 403 else
+             '(method or path not accepted by the endpoint)' if cmdb_write.status in [404, 405] else '' }}
+          {{ cmdb_response }}
+        success_msg: >-
+          {{ 'Updated' if cmdb_existing else 'Created' }} CI {{ inventory_hostname }}
+          (serial {{ cmdb_ci_payload.serial_number }}) via {{ cmdb_target_desc }}:
+          {{ (snow_host ~ '/nav_to.do?uri=' ~ snow_cmdb_table ~ '.do?sys_id=' ~ cmdb_ci_sys_id) if cmdb_ci_sys_id else cmdb_response }}
+      vars:
+        cmdb_target_desc: "{{ snow_cmdb_endpoint or snow_cmdb_table }}"
+        cmdb_response: >-
+          {{ (cmdb_write.json | default(cmdb_write.content | default(cmdb_write.msg | default(''))) | string)[:500] }}
+
+    # --- Relationships (cmdb_rel_ci) ---------------------------------------
+
+    - name: Check the CI sys_id is known for the relationships
+      ansible.builtin.assert:
+        that: cmdb_ci_sys_id | length > 0
+        fail_msg: >-
+          The response of {{ snow_cmdb_endpoint or snow_cmdb_table }} has no sys_id, so the
+          relationships cannot be created (set snow_cmdb_relations: [] to skip them).
+        quiet: true
+      when: snow_cmdb_relations | length > 0
+
+    - name: Look up the relationships that already exist
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_rel_url }}?sysparm_limit=1&sysparm_fields=sys_id&sysparm_query={{
+          ('parent=' ~ item.parent ~ '^child=' ~ cmdb_ci_sys_id ~ '^type=' ~ item.type) | urlencode }}
+        headers: "{{ snow_headers }}"
+      register: cmdb_rel_lookup
+      loop: "{{ snow_cmdb_relations }}"
+      delegate_to: localhost
+      become: false
+      failed_when: false
+      no_log: true
+
+    - name: Check the relationship lookups
+      ansible.builtin.assert:
+        that: cmdb_rel_lookup.results | rejectattr('status', 'eq', 200) | list | length == 0
+        fail_msg: >-
+          Reading cmdb_rel_ci failed: HTTP {{ cmdb_rel_lookup.results | map(attribute='status') | reject('eq', 200) | unique | join(', ') }}
+          {{ '(the API key needs read access to cmdb_rel_ci)'
+             if 403 in cmdb_rel_lookup.results | map(attribute='status') else '' }}
+        quiet: true
+      when: snow_cmdb_relations | length > 0
+
+    - name: Create the missing relationships
+      ansible.builtin.uri:
+        url: "{{ snow_rel_url }}?sysparm_fields=sys_id"
+        method: POST
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          parent: "{{ item.item.parent }}"
+          child: "{{ cmdb_ci_sys_id }}"
+          type: "{{ item.item.type }}"
+      register: cmdb_rel_create
+      loop: "{{ cmdb_rel_lookup.results | selectattr('json.result', 'equalto', []) | list }}"
+      loop_control:
+        label: "{{ item.item.parent }}"
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+    - name: Report the relationships
+      ansible.builtin.assert:
+        that: rel_failed | length == 0
+        fail_msg: >-
+          {{ rel_failed | length }} relationship(s) could not be created: HTTP
+          {{ rel_failed | map(attribute='status') | unique | join(', ') }}
+          {{ '(the API key needs create access to cmdb_rel_ci)'
+             if 403 in rel_failed | map(attribute='status') else '' }}
+          {{ (rel_failed | map(attribute='json') | map(attribute='error') | first | default({}) | to_json)[:300]
+             if rel_failed | selectattr('json', 'defined') | list else '' }}
+        success_msg: >-
+          Relationships of {{ inventory_hostname }}: {{ rel_created | length }} created,
+          {{ snow_cmdb_relations | length - cmdb_rel_create.results | length }} already existed.
+      vars:
+        rel_failed: "{{ cmdb_rel_create.results | rejectattr('status', 'eq', 201) | list }}"
+        rel_created: "{{ cmdb_rel_create.results | selectattr('status', 'eq', 201) | list }}"
+      when: snow_cmdb_relations | length > 0

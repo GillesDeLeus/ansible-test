@@ -1,0 +1,33 @@
+---
+# Sets rh_api_headers with a fresh console.redhat.com access token.
+# Tokens live about 15 minutes, so include this again after long waits.
+- name: Get a console.redhat.com access token
+  ansible.builtin.uri:
+    url: "{{ rh_token_url }}"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      grant_type: client_credentials
+      scope: api.console
+      client_id: "{{ rh_client_id }}"
+      client_secret: "{{ rh_client_secret }}"
+  register: rh_token
+  delegate_to: localhost
+  become: false
+  failed_when: false
+  no_log: true
+
+- name: Check the token request
+  ansible.builtin.assert:
+    that: rh_token.status == 200
+    fail_msg: >-
+      Red Hat SSO refused the service account (HTTP {{ rh_token.status }}):
+      check the client ID and secret.
+    quiet: true
+
+- name: Store the authorization header
+  ansible.builtin.set_fact:
+    rh_api_headers:
+      Accept: application/json
+      Authorization: "Bearer {{ rh_token.json.access_token }}"
+  no_log: true

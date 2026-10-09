@@ -1,0 +1,200 @@
+---
+# Provision a RHEL VM on OpenShift Virtualization and connect it to
+# console.redhat.com (Subscription, Insights, remote remediation).
+#
+# Job template requirements (see README):
+#   - Credential: "OpenShift or Kubernetes API Bearer Token"  -> K8S_AUTH_* env vars
+#     (token of the aap-vm-provisioner service account, openshift/vm-rbac.yml)
+#   - Credential: Machine (user cloud-user, private key, become sudo)
+#   - Credential: custom "Red Hat Activation Key"             -> rhc_org_id / rhc_activation_key
+#     (aap/credential-type-activation-key.yml)
+#   - Credential: custom "ServiceNow" (aap/credential-type-servicenow.yml), for
+#     the CMDB CI created at the end (register-cmdb-ci.yml); set
+#     snow_cmdb_register: false to skip it
+#   - Credential: custom "Red Hat Service Account"
+#     (aap/credential-type-redhat-service-account.yml), for the ServiceNow
+#     vulnerable items created from the VM's Insights CVEs at the end
+#     (sync-insights-cves.yml); set insights_cves_sync: false to skip it
+#   - Extra var or survey: vm_name, vm_ssh_public_key, vm_os (+ optional overrides below)
+# The job pod SSHes to the VM's pod network IP, so it must run in the same
+# cluster (container group) and no NetworkPolicy may block port 22.
+
+- name: Create the VM on OpenShift Virtualization
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    vm_namespace: rhel-vms                  # must match openshift/vm-rbac.yml
+    vm_instancetype: u1.medium
+    vm_os: rhel9                            # survey: rhel8 | rhel9 | rhel10
+    # Both follow vm_os so image and preference always match; override only
+    # through extra vars.
+    vm_os_datasource: "{{ vm_os }}"         # DataSource in openshift-virtualization-os-images
+    vm_preference: "{{ vm_os | replace('rhel', 'rhel.') }}"
+    vm_os_datasource_namespace: openshift-virtualization-os-images
+    vm_disk_size: 30Gi
+    vm_storage_class: ""                    # empty = cluster default
+    vm_user: cloud-user
+
+  tasks:
+    - name: Check required variables
+      ansible.builtin.assert:
+        that:
+          - vm_name is defined and vm_name | length > 0
+          - vm_name is match('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+          - vm_ssh_public_key is defined and vm_ssh_public_key | length > 0
+          - vm_os is match('^rhel[0-9]+$')    # registration needs RHEL
+        fail_msg: "Set vm_name (DNS-1123, lowercase), vm_ssh_public_key and vm_os (rhel8, rhel9, rhel10)."
+
+    - name: Create or update the VirtualMachine
+      kubevirt.core.kubevirt_vm:
+        state: present
+        name: "{{ vm_name }}"
+        namespace: "{{ vm_namespace }}"
+        labels:
+          app: "{{ vm_name }}"
+          provisioned-by: aap
+        instancetype:
+          name: "{{ vm_instancetype }}"
+        preference:
+          name: "{{ vm_preference }}"
+        data_volume_templates:
+          - metadata:
+              name: "{{ vm_name }}-rootdisk"
+            spec:
+              sourceRef:
+                kind: DataSource
+                name: "{{ vm_os_datasource }}"
+                namespace: "{{ vm_os_datasource_namespace }}"
+              storage: >-
+                {{ {'resources': {'requests': {'storage': vm_disk_size}}}
+                   | combine({'storageClassName': vm_storage_class} if vm_storage_class | length > 0 else {}) }}
+        spec:
+          domain:
+            devices: {}
+          volumes:
+            - name: rootdisk
+              dataVolume:
+                name: "{{ vm_name }}-rootdisk"
+            - name: cloudinitdisk
+              cloudInitNoCloud:
+                userData: |-
+                  #cloud-config
+                  hostname: {{ vm_name }}
+                  fqdn: {{ vm_name }}
+                  user: {{ vm_user }}
+                  ssh_pwauth: false
+                  disable_root: true
+                  ssh_authorized_keys:
+                    - {{ vm_ssh_public_key }}
+                  # No package install here: repos only work after registration.
+                  # The RHEL guest image already ships qemu-guest-agent.
+                  runcmd:
+                    - systemctl enable --now qemu-guest-agent
+        wait: true
+        wait_timeout: 900
+
+    - name: Wait for the VM to report an IP address (needs qemu-guest-agent)
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ vm_name }}"
+        namespace: "{{ vm_namespace }}"
+      register: vmi
+      until: >-
+        vmi.resources | length > 0
+        and (vmi.resources[0].status.interfaces | default([]) | selectattr('ipAddress', 'defined') | list | length > 0)
+      retries: 60
+      delay: 10
+
+    - name: Add the new VM to the in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ vm_name }}"
+        groups: new_vms
+        ansible_host: "{{ (vmi.resources[0].status.interfaces | selectattr('ipAddress', 'defined') | first).ipAddress }}"
+        ansible_user: "{{ vm_user }}"
+        vm_namespace: "{{ vm_namespace }}"
+
+- name: Connect the VM to console.redhat.com and Insights
+  hosts: new_vms
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Wait until SSH is available
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+        delay: 10
+
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    - name: Check registration variables
+      ansible.builtin.assert:
+        that:
+          - rhc_org_id is defined and rhc_org_id | length > 0
+          - rhc_activation_key is defined and rhc_activation_key | length > 0
+        fail_msg: "Attach the 'Red Hat Activation Key' credential to this job template."
+
+    - name: Register with RHSM, connect rhc and enable Insights with remediation
+      ansible.builtin.include_role:
+        name: redhat.rhel_system_roles.rhc
+      vars:
+        rhc_state: present
+        rhc_organization: "{{ rhc_org_id }}"
+        rhc_auth:
+          activation_keys:
+            keys:
+              - "{{ rhc_activation_key }}"
+        rhc_insights:
+          state: present
+          remediation: present
+          autoupdate: true
+        # System purpose; overrides what the activation key sets.
+        rhc_syspurpose:
+          service_level_agreement: "{{ vm_service_level | default('Standard') }}"
+
+    # The rhc role only registers when "insights-client --status" says "NOT"
+    # or "unregistered". On a never-registered RHEL 9.8 host
+    # (insights-client 3.9.3) it says "not yet been registered", so the role
+    # skips it. The .registered file only exists after a registration;
+    # --register also uploads the first report.
+    - name: Register with Insights if the rhc role did not
+      ansible.builtin.command: insights-client --register
+      args:
+        creates: /etc/insights-client/.registered
+      register: insights_register
+
+    - name: Upload a first Insights report so the host shows up immediately
+      ansible.builtin.command: insights-client
+      changed_when: false
+      when: insights_register is skipped
+
+- name: Refresh AAP inventories so the new VM can be targeted (optional)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  # Set aap_inventory_name, aap_inventory_source_ids (list of inventory source
+  # names or IDs in that inventory) and attach a "Red Hat Ansible Automation
+  # Platform" credential to enable this play.
+  tasks:
+    - name: Sync inventory sources
+      ansible.controller.inventory_source_update:
+        name: "{{ item }}"
+        inventory: "{{ aap_inventory_name }}"
+        wait: true
+      loop: "{{ aap_inventory_source_ids | default([]) }}"
+
+- name: Register the new VM in the ServiceNow CMDB
+  ansible.builtin.import_playbook: register-cmdb-ci.yml
+
+# # Waits for the first Insights vulnerability evaluation (usually a few minutes).
+# - name: Create ServiceNow vulnerable items for the VM's Insights CVEs
+#   ansible.builtin.import_playbook: sync-insights-cves.yml

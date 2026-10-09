@@ -1,0 +1,34 @@
+---
+# Retries cover old pods that are still terminating after the rollout.
+- name: Wait until every nginx container runs the patched tag
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ nginx_patch_namespace }}"
+    label_selectors:
+      - "{{ nginx_patch_pod_label_selector }}"
+  register: nginx_patch_pods
+  vars:
+    nginx_patch_images: >-
+      {{ nginx_patch_pods.resources | default([])
+         | map(attribute='spec.containers') | flatten
+         | map(attribute='image')
+         | select('search', nginx_patch_image_pattern) | list }}
+    nginx_patch_stale_images: >-
+      {{ nginx_patch_images
+         | reject('search', ':' ~ (nginx_patch_image_tag | string | regex_escape) ~ '$')
+         | list }}
+  until:
+    - nginx_patch_images | length > 0
+    - nginx_patch_stale_images | length == 0
+  retries: "{{ nginx_patch_verify_retries }}"
+  delay: "{{ nginx_patch_verify_delay }}"
+
+- name: Report the result
+  ansible.builtin.debug:
+    msg:
+      release: "{{ nginx_patch_namespace }}/{{ nginx_patch_release_name }}"
+      changed: "{{ nginx_patch_upgrade is changed }}"
+      images: >-
+        {{ nginx_patch_pods.resources
+           | map(attribute='spec.containers') | flatten
+           | map(attribute='image') | unique | list }}
