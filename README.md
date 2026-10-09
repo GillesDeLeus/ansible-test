@@ -164,10 +164,8 @@ Without `vulnerable_item_sys_id` (a manual run) the ServiceNow part is skipped.
 
 The playbook reads the items in batches of 100, stops before changing anything
 when a sys_id is not a readable vulnerable item, skips items that are already
-Resolved, and updates the rest through the Batch API (`/now/v1/batch`), one
-call per 100 items instead of one PATCH each. It fails when ServiceNow kept the
-old state of an item (business rule or ACL) or did not service a request
-before its batch timeout. With `fixed_cves`, only the items whose CVE (`vulnerability.id`)
+Resolved, and fails when ServiceNow kept the old state of an item (business
+rule or ACL). With `fixed_cves`, only the items whose CVE (`vulnerability.id`)
 is in that list are resolved.
 
 Remediation job template:
@@ -175,8 +173,8 @@ Remediation job template:
 - Extra variables: "Prompt on launch", so the launch API accepts
   `vulnerable_item_sys_id`.
 - ServiceNow access: the API Access Policy must cover the Table API resources
-  `/now/table/{tableName}` (GET) for `sn_vul_vulnerable_item` and the Batch
-  API (`/now/v1/batch`), and `/now/table/{tableName}/{sys_id}` (GET and
+  `/now/table/{tableName}` (GET) and `/now/table/{tableName}/{sys_id}` (PATCH)
+  for `sn_vul_vulnerable_item`, and `/now/table/{tableName}/{sys_id}` (GET and
   PATCH) for the remediation task table (`sn_vul_vulnerability`) when
   `remtask_sys_id` is sent. The key's user needs write access to both
   (e.g. `sn_vul.remediation_owner`).
@@ -197,8 +195,6 @@ fixed_cves: [CVE-2025-71116, CVE-2025-71147]        # optional
 | `cmdb_ci_sys_id` | empty | Only resolve items of this CI |
 | `remtask_sys_id` | empty | Remediation task to set to Resolved once all items are Resolved |
 | `snow_vi_resolved_state` | `Resolved` | State label to set on the items (label, not number) |
-| `snow_batch_size` | `100` | Items per Batch API call; lower it if requests come back unserviced |
-| `snow_batch_timeout` | `300` | Seconds one Batch API call may take |
 | `snow_remtask_table` | `sn_vul_vulnerability` | Table of the remediation task |
 | `snow_remtask_resolved_state` | `Resolved` | State label to set on the task |
 
