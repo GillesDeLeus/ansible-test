@@ -163,7 +163,9 @@ open. Without `remtask_sys_id` (a manual run) the ServiceNow part is skipped.
 
 The playbook reads the task first (a wrong sys_id or missing access stops the
 job), skips the update when the task is already Resolved, and checks the state
-ServiceNow stored. It then reads back the vulnerable items sent and waits up to
+ServiceNow stored. Resolving the task resolves its items in the same request,
+which can take minutes; if the request still times out, the playbook keeps
+reading the task until ServiceNow has finished. It then reads back the vulnerable items sent and waits up to
 2 minutes for all of them to be Resolved or Closed, failing with the ones still
 open; if that happens, resolving the task through the API does not resolve its
 items, and `resolve-vulnerable-items.yml` does it item by item.
@@ -192,6 +194,8 @@ vulnerable_item_sys_id: ae292f5d47bb8b105f8e370cd36d4365,66292f5d47bb8b105f8e370
 | `vulnerable_item_sys_id` | empty | Vulnerable items to check afterwards (comma-separated, or a list); `vulnerable_item_sys_ids` also works |
 | `snow_remtask_table` | `sn_vul_vulnerability` | Table of the remediation task |
 | `snow_remtask_resolved_state` | `Resolved` | State label to set on the task (label, not number) |
+| `snow_remtask_timeout` | `600` | Seconds the task update may take (ServiceNow resolves the items in the same request) |
+| `snow_remtask_recheck_retries` / `snow_remtask_recheck_delay` | `30` / `20` | After a timeout, how long to keep reading the task until it is Resolved |
 | `snow_vi_verify` | `true` | Check the vulnerable items afterwards |
 | `snow_vi_done_states` | `[Resolved, Closed]` | Item states that count as resolved |
 | `snow_vi_verify_retries` / `snow_vi_verify_delay` | `12` / `10` | How long to wait for ServiceNow to resolve the items |

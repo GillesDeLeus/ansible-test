@@ -37,6 +37,12 @@
     # Choice label, not number (sysparm_input_display_value=true).
     snow_remtask_resolved_state: Resolved
     snow_remtask_work_note: "Remediated by Ansible Automation Platform (job {{ tower_job_id | default('n/a') }})."
+    # Resolving the task resolves its vulnerable items in the same request, so
+    # the PATCH can take minutes with hundreds of items. When it still times
+    # out, ServiceNow keeps going: the task is read again until it is Resolved.
+    snow_remtask_timeout: 600
+    snow_remtask_recheck_retries: 30
+    snow_remtask_recheck_delay: 20
     # Check of the vulnerable items afterwards: states that count as done, and
     # how long to wait for ServiceNow to resolve them (it may do so async).
     snow_vi_verify: true
@@ -100,19 +106,38 @@
         body:
           state: "{{ snow_remtask_resolved_state }}"
           work_notes: "{{ snow_remtask_work_note }}"
+        timeout: "{{ snow_remtask_timeout }}"
       register: remtask_after
       when: remtask_before.json.result.state != snow_remtask_resolved_state
       changed_when: remtask_after.status | default(0) == 200
       failed_when: false
       no_log: true
 
+    - name: Wait for the remediation task after a timeout
+      ansible.builtin.uri:
+        url: "{{ snow_remtask_url }}?sysparm_display_value=true&sysparm_fields=number,state"
+        headers: "{{ snow_headers }}"
+      register: remtask_recheck
+      until: >-
+        remtask_recheck.status in [401, 403, 404]
+        or (remtask_recheck.json.result.state | default('')) == snow_remtask_resolved_state
+      retries: "{{ snow_remtask_recheck_retries }}"
+      delay: "{{ snow_remtask_recheck_delay }}"
+      failed_when: false
+      no_log: true
+      when: remtask_after is not skipped and remtask_after.status | default(0) == -1
+
     # Read back: ServiceNow can answer 200 and keep the state.
     - name: Report the remediation task
       ansible.builtin.assert:
-        that: remtask_after.status == 200 and remtask_state == snow_remtask_resolved_state
+        that: (remtask_after.status == 200 or timed_out) and remtask_state == snow_remtask_resolved_state
         fail_msg: >-
           {{ remtask_number }} was not resolved:
-          {{ ('HTTP ' ~ remtask_after.status ~ ' '
+          {{ ('the update timed out after ' ~ snow_remtask_timeout ~ 's and the task is still "' ~ remtask_state
+              ~ '" after another ' ~ (snow_remtask_recheck_retries | int * snow_remtask_recheck_delay | int)
+              ~ 's (raise snow_remtask_timeout or snow_remtask_recheck_retries)')
+             if timed_out else
+             ('HTTP ' ~ remtask_after.status ~ ' '
               ~ ('(the API Access Policy must cover PATCH /now/table/{tableName}/{sys_id} for ' ~ snow_remtask_table ~ ')'
                  if remtask_after.status == 401 else
                  '(no write access to ' ~ snow_remtask_table ~ ')' if remtask_after.status == 403 else '')
@@ -120,11 +145,14 @@
              if remtask_after.status != 200 else
              'still "' ~ remtask_state ~ '" (business rule, ACL, missing role, or "'
              ~ snow_remtask_resolved_state ~ '" is not a state of this table: set snow_remtask_resolved_state)' }}
-        success_msg: "{{ remtask_number }} is now {{ snow_remtask_resolved_state }}."
+        success_msg: >-
+          {{ remtask_number }} is now {{ snow_remtask_resolved_state }}{{
+          ' (the update timed out after ' ~ snow_remtask_timeout ~ 's, ServiceNow finished it afterwards)' if timed_out else '' }}.
       vars:
+        timed_out: "{{ remtask_recheck is not skipped }}"
         # Both messages are templated whatever the outcome, and an error
         # response has no result, so nothing here may assume one.
-        remtask_result: "{{ (remtask_after.json | default({})).result | default({}) }}"
+        remtask_result: "{{ ((remtask_recheck if timed_out else remtask_after).json | default({})).result | default({}) }}"
         remtask_state: "{{ remtask_result.state | default('') if remtask_result is mapping else '' }}"
         remtask_number: "{{ remtask_before.json.result.number | default(remtask_sys_id) }}"
         remtask_error: >-
