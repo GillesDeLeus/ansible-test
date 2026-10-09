@@ -1,31 +1,26 @@
 ---
-# Resolve the vulnerable items of a ServiceNow remediation task. With
-# fixed_cves, only the items whose CVE is in that list; without it, all of them.
-# With remtask_sys_id, the remediation task itself is then set to Resolved too,
-# once every vulnerable item sent is Resolved.
+# Set a ServiceNow remediation task to Resolved. ServiceNow then resolves the
+# task's vulnerable items itself; with vulnerable_item_sys_id the playbook
+# checks that it did. To resolve vulnerable items one by one instead, use
+# resolve-vulnerable-items.yml.
 #
 # Imported at the end of cve-remediation.yaml, so the job ServiceNow launches
-# resolves the items it was sent once the remediation succeeded. Can also run
-# on its own.
+# resolves the task once the remediation succeeded. Can also run on its own.
 #
 # Job template requirements (see README):
 #   - Credential: custom "ServiceNow" (aap/credential-type-servicenow.yml)
 #     -> SN_HOST / SN_API_KEY env vars (REST API key, sent as x-sn-apikey)
 #   - Extra vars:
-#       vulnerable_item_sys_id (or vulnerable_item_sys_ids): sys_ids of the
-#         task's vulnerable items, as sent by ServiceNow when the task is
-#         approved (comma-separated string or list)
-#       fixed_cves: optional, list of CVE ids (or a comma-separated string)
-#       cmdb_ci_sys_id: optional, only items of this CI
-#       remtask_sys_id: optional, sys_id of the remediation task to resolve
-# ServiceNow access: the items are updated through the Batch API
-# (POST /now/v1/batch, one call per snow_batch_size items), so the API Access
-# Policy must cover that API; the user needs write access to
-# sn_vul_vulnerable_item, plus read access to the vulnerability records
-# (vulnerability.id is dot-walked). With remtask_sys_id also read/write on the
-# remediation task table (Table API GET/PATCH /now/table/{tableName}/{sys_id}).
+#       remtask_sys_id: sys_id of the remediation task
+#       vulnerable_item_sys_id (or vulnerable_item_sys_ids): optional, the
+#         task's vulnerable items (comma-separated string or list), checked
+#         to be resolved afterwards
+# ServiceNow access: the API Access Policy must cover the Table API
+# GET/PATCH /now/table/{tableName}/{sys_id} for the remediation task table,
+# and GET /now/table/{tableName} for sn_vul_vulnerable_item when the items are
+# checked; the user needs write access to the task (e.g. sn_vul.remediation_owner).
 
-- name: Resolve the fixed vulnerable items of a remediation task
+- name: Resolve a remediation task
   hosts: localhost
   connection: local
   gather_facts: false
@@ -36,63 +31,48 @@
     snow_headers:
       Accept: application/json
       x-sn-apikey: "{{ snow_api_key }}"
+    remtask_sys_id: ""
+    snow_remtask_table: sn_vul_vulnerability
+    snow_remtask_url: "{{ snow_host }}/api/now/table/{{ snow_remtask_table }}/{{ remtask_sys_id | trim | lower }}"
+    # Choice label, not number (sysparm_input_display_value=true).
+    snow_remtask_resolved_state: Resolved
+    snow_remtask_work_note: "Remediated by Ansible Automation Platform (job {{ tower_job_id | default('n/a') }})."
+    # Check of the vulnerable items afterwards: states that count as done, and
+    # how long to wait for ServiceNow to resolve them (it may do so async).
+    snow_vi_verify: true
     snow_vi_table: sn_vul_vulnerable_item
     snow_vi_api: "{{ snow_host }}/api/now/table/{{ snow_vi_table }}"
-    # Choice label, not number (sysparm_input_display_value=true).
-    snow_vi_resolved_state: Resolved
-    # Items per Batch API call, and how long one call may take: ServiceNow
-    # runs the sub-requests one after the other.
-    snow_batch_size: 100
-    snow_batch_timeout: 300
+    snow_vi_done_states: [Resolved, Closed]
+    snow_vi_verify_retries: 12
+    snow_vi_verify_delay: 10
     # sys_ids per lookup call: 100 keeps the URL around 3.5 KB.
     snow_query_batch: 100
-    cmdb_ci_sys_id: ""
-    # Lists or comma/space separated strings; sys_ids lower case, CVEs upper case.
-    # ServiceNow sends vulnerable_item_sys_id; the plural is kept for manual runs.
     vi_sys_id_input: "{{ vulnerable_item_sys_ids | default(vulnerable_item_sys_id | default([])) }}"
     vi_sys_id_list: >-
       {{ (vi_sys_id_input if vi_sys_id_input is not string
           else vi_sys_id_input | split(',') | map('split') | flatten)
          | map('trim') | reject('eq', '') | map('lower') | unique | list }}
-    fixed_cves: []
-    # Remediation task: read before any change, resolved at the end.
-    remtask_sys_id: ""
-    snow_remtask_table: sn_vul_vulnerability
-    snow_remtask_url: "{{ snow_host }}/api/now/table/{{ snow_remtask_table }}/{{ remtask_sys_id | trim | lower }}"
-    snow_remtask_resolved_state: Resolved
-    snow_remtask_work_note: >-
-      All {{ task_items | length }} vulnerable items resolved by Ansible Automation Platform
-      (job {{ tower_job_id | default('n/a') }}).
-    fixed_cve_list: >-
-      {{ (fixed_cves if fixed_cves is not string else fixed_cves | split(',') | map('split') | flatten)
-         | map('trim') | reject('eq', '') | map('upper') | unique | list }}
 
   tasks:
     - name: Check required variables
       ansible.builtin.assert:
         that:
-          - vi_sys_id_list | length > 0
+          - remtask_sys_id | trim | lower is match('^[0-9a-f]{32}$')
           - vi_sys_id_list | reject('match', '^[0-9a-f]{32}$') | list | length == 0
-          - cmdb_ci_sys_id | length == 0 or cmdb_ci_sys_id is match('^[0-9a-f]{32}$')
-          - remtask_sys_id | trim | length == 0 or remtask_sys_id | trim | lower is match('^[0-9a-f]{32}$')
           - snow_host | length > 0
           - snow_api_key | length > 0
         fail_msg: >-
-          Set vulnerable_item_sys_id (comma-separated sys_ids of 32 hex characters),
-          optionally fixed_cves, cmdb_ci_sys_id and remtask_sys_id (32 hex characters),
-          and attach the ServiceNow credential.
+          Set remtask_sys_id (32 hex characters), optionally vulnerable_item_sys_id
+          (comma-separated sys_ids), and attach the ServiceNow credential.
         quiet: true
 
     # The API key is a plain header, which Ansible does not mask, so the API
     # calls are no_log and the asserts after them report errors instead.
-    # The task is read first, so a wrong sys_id or missing access stops the
-    # job before any vulnerable item changes.
     - name: Read the remediation task
       ansible.builtin.uri:
         url: "{{ snow_remtask_url }}?sysparm_display_value=true&sysparm_fields=number,state"
         headers: "{{ snow_headers }}"
       register: remtask_before
-      when: remtask_sys_id | trim | length > 0
       failed_when: false
       no_log: true
 
@@ -110,188 +90,6 @@
              if remtask_before.status == 403 else
              'Reading the remediation task failed: HTTP ' ~ remtask_before.status }}
         quiet: true
-      when: remtask_before is not skipped
-
-    - name: Read the vulnerable items
-      ansible.builtin.uri:
-        url: >-
-          {{ snow_vi_api }}?sysparm_limit={{ snow_query_batch }}&sysparm_display_value=all&sysparm_exclude_reference_link=true&sysparm_fields=sys_id,number,state,cmdb_ci,vulnerability.id&sysparm_query={{
-          ('sys_idIN' ~ item | join(',')) | urlencode }}
-        headers: "{{ snow_headers }}"
-      register: snow_vis
-      loop: "{{ vi_sys_id_list | batch(snow_query_batch) | list }}"
-      loop_control:
-        label: "{{ item | length }} sys_ids"
-      failed_when: false
-      no_log: true
-
-    - name: Check the vulnerable items were read
-      ansible.builtin.assert:
-        that: vi_read_failed | length == 0
-        fail_msg: >-
-          {{ 'ServiceNow rejected the API key (check the key and the API Access Policy).'
-             if 401 in vi_read_failed else
-             'The API key has no read access to ' ~ snow_vi_table ~ '.'
-             if 403 in vi_read_failed else
-             'Reading vulnerable items failed: HTTP ' ~ vi_read_failed | unique | join(', ') }}
-        quiet: true
-      vars:
-        vi_read_failed: "{{ snow_vis.results | map(attribute='status') | reject('eq', 200) | list }}"
-
-    - name: Match the items against the fixed CVEs
-      ansible.builtin.set_fact:
-        task_items: "{{ task_items_all }}"
-        fixed_items: >-
-          {{ (task_items_all | selectattr('cve', 'in', fixed_cve_list) | list)
-             if fixed_cve_list else task_items_all }}
-        vi_not_found: "{{ vi_sys_id_list | difference(vi_records | map(attribute='sys_id.value')) }}"
-      vars:
-        vi_records: "{{ snow_vis.results | map(attribute='json') | map(attribute='result') | flatten }}"
-        task_items_all: >-
-          {%- set out = [] -%}
-          {%- for r in vi_records
-                if cmdb_ci_sys_id | length == 0 or (r.cmdb_ci.value | default('')) == cmdb_ci_sys_id -%}
-            {%- set _ = out.append({
-                  'sys_id': r.sys_id.value,
-                  'number': r.number.display_value,
-                  'state': r.state.display_value,
-                  'cve': (r['vulnerability.id'].value | default('', true) | upper)}) -%}
-          {%- endfor -%}
-          {{ out }}
-
-    # A sys_id that returns nothing is a typo, a deleted item, or an item the
-    # key cannot read (ACL): stop instead of resolving a partial set.
-    - name: Check every vulnerable item was found
-      ansible.builtin.assert:
-        that: vi_not_found | length == 0
-        fail_msg: >-
-          {{ vi_not_found | length }} of {{ vi_sys_id_list | length }} sys_ids are not readable
-          {{ snow_vi_table }} records: {{ vi_not_found | join(', ') | truncate(500) }}
-        quiet: true
-
-    # One Batch API call per snow_batch_size items instead of one PATCH each:
-    # every sub-request is a Table API PATCH, its body base64 encoded.
-    # /api/now/v1/batch itself is a public page that runs as guest, and each
-    # sub-request is authenticated on its own headers, so every sub-request
-    # carries the API key; without it the Table API answers 401.
-    - name: Set the fixed vulnerable items to {{ snow_vi_resolved_state }}
-      ansible.builtin.uri:
-        url: "{{ snow_host }}/api/now/v1/batch"
-        method: POST
-        headers: "{{ snow_headers }}"
-        body_format: json
-        body:
-          batch_request_id: "{{ tower_job_id | default('manual') }}-{{ batch_index }}"
-          rest_requests: "{{ batch_requests }}"
-        timeout: "{{ snow_batch_timeout }}"
-      register: vi_batches
-      loop: "{{ fixed_items | rejectattr('state', 'eq', snow_vi_resolved_state) | batch(snow_batch_size) | list }}"
-      loop_control:
-        index_var: batch_index
-        label: "batch {{ batch_index + 1 }}: {{ item | length }} items"
-      vars:
-        batch_requests: >-
-          {%- set out = [] -%}
-          {%- for vi in item -%}
-            {%- set _ = out.append({
-                  'id': vi.sys_id,
-                  'method': 'PATCH',
-                  'url': '/api/now/table/' ~ snow_vi_table ~ '/' ~ vi.sys_id
-                         ~ '?sysparm_input_display_value=true&sysparm_display_value=true&sysparm_fields=number,state',
-                  'headers': [{'name': 'Content-Type', 'value': 'application/json'},
-                              {'name': 'Accept', 'value': 'application/json'},
-                              {'name': 'x-sn-apikey', 'value': snow_api_key}],
-                  'exclude_response_headers': true,
-                  'body': ({'state': snow_vi_resolved_state,
-                            'work_notes': 'Remediated by Ansible Automation Platform (job '
-                                          ~ (tower_job_id | default('n/a')) ~ '): '
-                                          ~ (vi.cve or 'vulnerability') ~ ' '
-                                          ~ ('fixed' if fixed_cve_list else 'remediated') ~ '.'}
-                           | to_json | b64encode)}) -%}
-          {%- endfor -%}
-          {{ out }}
-      changed_when: vi_batches.status | default(0) == 200
-      failed_when: false
-      no_log: true
-
-    # One entry per item sent: the sub-request status and the state stored
-    # afterwards. Business rules or ACLs can keep the old state while the API
-    # still answers 200, and requests ServiceNow did not get to before its
-    # batch timeout come back as unserviced.
-    - name: Collect the vulnerable item updates
-      ansible.builtin.set_fact:
-        vi_updates: "{{ vi_update_list }}"
-      vars:
-        vi_numbers: "{{ dict(fixed_items | map(attribute='sys_id') | zip(fixed_items | map(attribute='number'))) }}"
-        vi_update_list: >-
-          {%- set out = [] -%}
-          {%- for b in vi_batches.results | default([]) -%}
-            {%- set resp = b.json | default({}) if b.json | default({}) is mapping else {} -%}
-            {%- set seen = [] -%}
-            {%- for r in resp.serviced_requests | default([]) -%}
-              {%- set body = (r.body | b64decode | from_json) if r.body | default('') | length > 0 else {} -%}
-              {%- set _ = seen.append(r.id) -%}
-              {%- set _ = out.append({
-                    'sys_id': r.id,
-                    'number': vi_numbers[r.id] | default(r.id),
-                    'status': r.status_code | int,
-                    'state': (body.result.state | default('')) if body.result is defined and body.result is mapping else '',
-                    'error': ([body.error.message | default(''), body.error.detail | default('')] | select | join(': '))
-                             if body.error is defined and body.error is mapping else ''}) -%}
-            {%- endfor -%}
-            {#- Requests without an answer: unserviced, or the whole batch call failed. -#}
-            {%- for vi in b.item if vi.sys_id not in seen -%}
-              {%- set _ = out.append({
-                    'sys_id': vi.sys_id,
-                    'number': vi.number,
-                    'status': b.status | default(-1) if b.status | default(-1) != 200 else 0,
-                    'state': '',
-                    'error': (resp.error.message | default(b.msg | default('')))
-                             if b.status | default(-1) != 200 else 'not serviced (batch timeout)'}) -%}
-            {%- endfor -%}
-          {%- endfor -%}
-          {{ out }}
-
-    - name: Report the result
-      ansible.builtin.assert:
-        that: vi_failed | length == 0
-        fail_msg: >-
-          {{ vi_failed | length }} of {{ vi_updates | length }} item(s) not resolved:
-          {{ vi_failed | map(attribute='number') | join(', ') | truncate(300) }}
-          (HTTP {{ vi_failed | map(attribute='status') | unique | join(', ') }}
-          {%- if vi_errors %}: {{ vi_errors | join('; ') | truncate(300) }}{% endif %}).
-          {{ 'HTTP 401: the API Access Policy must cover the Batch API (/now/v1/batch). '
-             if 401 in vi_failed | map(attribute='status') else '' -}}
-          {{ 'HTTP 0: ServiceNow did not service these requests in time; lower snow_batch_size. '
-             if 0 in vi_failed | map(attribute='status') else '' -}}
-          A 200 here means a business rule, ACL or missing role kept the old state.
-        success_msg: >-
-          {{ task_items | length }} vulnerable items,
-          {{ (fixed_items | length ~ ' match the ' ~ fixed_cve_list | length ~ ' fixed CVEs:')
-             if fixed_cve_list else 'all to resolve:' }}
-          {{ vi_resolved | length }} set to {{ snow_vi_resolved_state }}
-          in {{ vi_batches.results | default([]) | length }} batch call(s),
-          {{ fixed_items | length - vi_updates | length }} already {{ snow_vi_resolved_state }}.
-          {{ ('Fixed CVEs not in these items: ' ~ cves_missing | join(', ') ~ '.') if cves_missing else '' }}
-      vars:
-        vi_resolved: "{{ vi_updates | selectattr('status', 'eq', 200) | selectattr('state', 'eq', snow_vi_resolved_state) | list }}"
-        vi_failed: "{{ vi_updates | difference(vi_resolved) }}"
-        vi_errors: "{{ vi_failed | map(attribute='error') | select | unique | list }}"
-        cves_missing: "{{ fixed_cve_list | difference(task_items | map(attribute='cve')) }}"
-
-    # --- Remediation task ---------------------------------------------------
-
-    # Only when every item sent is Resolved: with fixed_cves, items with other
-    # CVEs stay open and so does the task.
-    - name: Find the vulnerable items that are still open
-      ansible.builtin.set_fact:
-        vi_still_open: >-
-          {{ task_items | rejectattr('state', 'eq', snow_vi_resolved_state)
-             | rejectattr('sys_id', 'in', vi_updates | selectattr('status', 'eq', 200)
-                          | selectattr('state', 'eq', snow_vi_resolved_state)
-                          | map(attribute='sys_id') | list)
-             | list }}
-      when: remtask_before is not skipped
 
     - name: Set the remediation task to {{ snow_remtask_resolved_state }}
       ansible.builtin.uri:
@@ -303,15 +101,12 @@
           state: "{{ snow_remtask_resolved_state }}"
           work_notes: "{{ snow_remtask_work_note }}"
       register: remtask_after
-      when:
-        - remtask_before is not skipped
-        - vi_still_open | length == 0
-        - remtask_before.json.result.state != snow_remtask_resolved_state
+      when: remtask_before.json.result.state != snow_remtask_resolved_state
       changed_when: remtask_after.status | default(0) == 200
       failed_when: false
       no_log: true
 
-    # Read back, as for the items: ServiceNow can answer 200 and keep the state.
+    # Read back: ServiceNow can answer 200 and keep the state.
     - name: Report the remediation task
       ansible.builtin.assert:
         that: remtask_after.status == 200 and remtask_state == snow_remtask_resolved_state
@@ -337,11 +132,58 @@
              | default(remtask_after.msg | default(''), true) | string | truncate(300) }}
       when: remtask_after is not skipped
 
-    - name: Report a remediation task that was left alone
+    - name: Report a remediation task that was already resolved
       ansible.builtin.debug:
-        msg: >-
-          {{ remtask_before.json.result.number }}
-          {{ ('was already ' ~ snow_remtask_resolved_state ~ '.') if vi_still_open | length == 0 else
-             ('stays "' ~ remtask_before.json.result.state ~ '": ' ~ vi_still_open | length
-              ~ ' vulnerable item(s) still open (' ~ vi_still_open | map(attribute='number') | join(', ') | truncate(300) ~ ').') }}
-      when: remtask_before is not skipped and remtask_after is skipped
+        msg: "{{ remtask_before.json.result.number }} was already {{ snow_remtask_resolved_state }}."
+      when: remtask_after is skipped
+
+    # --- Vulnerable items ---------------------------------------------------
+
+    # Resolving the task is expected to resolve its items; check it did,
+    # waiting in case ServiceNow does it in the background.
+    - name: Wait for ServiceNow to resolve the vulnerable items
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_vi_api }}?sysparm_limit={{ snow_query_batch }}&sysparm_display_value=true&sysparm_fields=sys_id,number,state&sysparm_query={{
+          ('sys_idIN' ~ item | join(',')) | urlencode }}
+        headers: "{{ snow_headers }}"
+      register: snow_vis
+      loop: "{{ vi_sys_id_list | batch(snow_query_batch) | list }}"
+      loop_control:
+        label: "{{ item | length }} sys_ids"
+      until: >-
+        snow_vis.status != 200
+        or snow_vis.json.result | rejectattr('state', 'in', snow_vi_done_states) | list | length == 0
+      retries: "{{ snow_vi_verify_retries }}"
+      delay: "{{ snow_vi_verify_delay }}"
+      failed_when: false
+      no_log: true
+      when: snow_vi_verify | bool and vi_sys_id_list | length > 0
+
+    - name: Check the vulnerable items were resolved
+      ansible.builtin.assert:
+        that:
+          - vi_read_failed | length == 0
+          - vi_not_found | length == 0
+          - vi_open | length == 0
+        fail_msg: >-
+          {{ ('Reading vulnerable items failed: HTTP ' ~ vi_read_failed | unique | join(', ')
+              ~ (' (the API Access Policy must cover GET /now/table/{tableName} for ' ~ snow_vi_table ~ ')'
+                 if 401 in vi_read_failed else ''))
+             if vi_read_failed else
+             (vi_open | length ~ ' of ' ~ vi_sys_id_list | length ~ ' vulnerable items are still open after '
+              ~ (snow_vi_verify_retries | int * snow_vi_verify_delay | int) ~ 's: '
+              ~ vi_open | map(attribute='number') | join(', ') | truncate(300)
+              ~ ' (resolving the task through the API did not resolve them: run resolve-vulnerable-items.yml).')
+             if vi_open else
+             (vi_not_found | length ~ ' sys_ids are not readable ' ~ snow_vi_table ~ ' records: '
+              ~ vi_not_found | join(', ') | truncate(300)) }}
+        success_msg: >-
+          All {{ vi_sys_id_list | length }} vulnerable items are
+          {{ vi_records | map(attribute='state') | unique | join(' or ') }}.
+      vars:
+        vi_read_failed: "{{ snow_vis.results | map(attribute='status') | reject('eq', 200) | list }}"
+        vi_records: "{{ snow_vis.results | selectattr('status', 'eq', 200) | map(attribute='json.result') | flatten }}"
+        vi_open: "{{ vi_records | rejectattr('state', 'in', snow_vi_done_states) | list }}"
+        vi_not_found: "{{ vi_sys_id_list | difference(vi_records | map(attribute='sys_id')) }}"
+      when: snow_vis is not skipped

@@ -15,7 +15,8 @@ charts/vulnerable-nginx/              chart of that release, extracted from the 
 provision-vm.yml                      create a RHEL VM on OpenShift Virtualization, register it with console.redhat.com
 aap/credential-type-activation-key.yml  custom AAP credential type for the RHSM activation key
 resolve-vulnerable-item.yml           set a ServiceNow vulnerable item to Resolved
-resolve-remediation-task.yml          resolve the vulnerable items ServiceNow sent (imported by cve-remediation.yaml)
+resolve-remediation-task.yml          resolve the remediation task ServiceNow sent (imported by cve-remediation.yaml)
+resolve-vulnerable-items.yml          resolve vulnerable items one by one
 register-cmdb-ci.yml                  create/update the VM's CI through createCI (run at the end of provision-vm.yml)
 sync-insights-cves.yml                ServiceNow vulnerable item per Insights CVE of the VM (run after register-cmdb-ci.yml)
 tasks/redhat-api-token.yml            console.redhat.com token for the service account
@@ -149,42 +150,65 @@ is already Resolved is left alone.
 | `snow_vi_resolved_state` | `Resolved` | State label to set (label, not number) |
 | `snow_vi_work_note` | AAP job reference | Work note added with the change |
 
-## Resolving the vulnerable items of a remediation task (`resolve-remediation-task.yml`)
+## Resolving a remediation task (`resolve-remediation-task.yml`)
 
 ServiceNow launches the remediation job template (`cve-remediation.yaml`) when
-a remediation task is approved, with the task's vulnerable items as
-`vulnerable_item_sys_id` (comma-separated sys_ids). After the remediation plays,
-the job checks that the remediation ran on at least one host and failed on none,
-then imports `resolve-remediation-task.yml`, which sets those vulnerable items
-to `Resolved` with a work note. With `remtask_sys_id` (the remediation task),
-it then sets the task to `Resolved` too, once every item sent is Resolved;
-the task is read before any item changes, so a wrong sys_id or missing access
-stops the job first. A failed or empty remediation leaves everything open.
-Without `vulnerable_item_sys_id` (a manual run) the ServiceNow part is skipped.
+a remediation task is approved, with the task as `remtask_sys_id` and its
+vulnerable items as `vulnerable_item_sys_id` (comma-separated sys_ids). After
+the remediation plays, the job checks that the remediation ran on at least one
+host and failed on none, then imports `resolve-remediation-task.yml`, which
+sets the task to `Resolved` with a work note. ServiceNow then resolves the
+task's vulnerable items itself. A failed or empty remediation leaves the task
+open. Without `remtask_sys_id` (a manual run) the ServiceNow part is skipped.
 
-The playbook reads the items in batches of 100, stops before changing anything
-when a sys_id is not a readable vulnerable item, skips items that are already
-Resolved, and updates the rest through the Batch API (`/now/v1/batch`), one
-call per 100 items instead of one PATCH each. It fails when ServiceNow kept the
-old state of an item (business rule or ACL) or did not service a request
-before its batch timeout. With `fixed_cves`, only the items whose CVE (`vulnerability.id`)
-is in that list are resolved.
+The playbook reads the task first (a wrong sys_id or missing access stops the
+job), skips the update when the task is already Resolved, and checks the state
+ServiceNow stored. It then reads back the vulnerable items sent and waits up to
+2 minutes for all of them to be Resolved or Closed, failing with the ones still
+open; if that happens, resolving the task through the API does not resolve its
+items, and `resolve-vulnerable-items.yml` does it item by item.
 
 Remediation job template:
 - Credentials: Machine, plus the "ServiceNow" credential (SN_HOST/SN_API_KEY).
 - Extra variables: "Prompt on launch", so the launch API accepts
-  `vulnerable_item_sys_id`.
-- ServiceNow access: the API Access Policy must cover the Table API resources
-  `/now/table/{tableName}` (GET) and `/now/table/{tableName}/{sys_id}` (PATCH)
-  for `sn_vul_vulnerable_item`: the Batch API (`/now/v1/batch`) is a public
-  page that runs as guest and needs no policy, but every PATCH inside it is
-  authenticated separately, so the playbook sends the API key in each one. And `/now/table/{tableName}/{sys_id}` (GET and
-  PATCH) for the remediation task table (`sn_vul_vulnerability`) when
-  `remtask_sys_id` is sent. The key's user needs write access to both
-  (e.g. `sn_vul.remediation_owner`).
+  `remtask_sys_id` and `vulnerable_item_sys_id`.
+- ServiceNow access: the API Access Policy must cover the Table API resource
+  `/now/table/{tableName}/{sys_id}` (GET and PATCH) for the remediation task
+  table (`sn_vul_vulnerability`), and `/now/table/{tableName}` (GET) for
+  `sn_vul_vulnerable_item` for the check. The key's user needs write access to
+  the task (e.g. `sn_vul.remediation_owner`).
 
 To run it on its own, use a job template with the ServiceNow credential and the
 inventory with `localhost`:
+
+```yaml
+remtask_sys_id: 3a65b351c3770b10fff8b14bb001315c
+vulnerable_item_sys_id: ae292f5d47bb8b105f8e370cd36d4365,66292f5d47bb8b105f8e370cd36d436a   # optional
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `remtask_sys_id` | required | sys_id of the remediation task |
+| `vulnerable_item_sys_id` | empty | Vulnerable items to check afterwards (comma-separated, or a list); `vulnerable_item_sys_ids` also works |
+| `snow_remtask_table` | `sn_vul_vulnerability` | Table of the remediation task |
+| `snow_remtask_resolved_state` | `Resolved` | State label to set on the task (label, not number) |
+| `snow_vi_verify` | `true` | Check the vulnerable items afterwards |
+| `snow_vi_done_states` | `[Resolved, Closed]` | Item states that count as resolved |
+| `snow_vi_verify_retries` / `snow_vi_verify_delay` | `12` / `10` | How long to wait for ServiceNow to resolve the items |
+
+## Resolving vulnerable items one by one (`resolve-vulnerable-items.yml`)
+
+Sets the vulnerable items sent to `Resolved` with a work note, one Table API
+PATCH per item, and leaves the remediation task alone. It reads the items in
+batches of 100, stops before changing anything when a sys_id is not a readable
+vulnerable item, skips items that are already Resolved, and fails when
+ServiceNow kept the old state of an item (business rule or ACL). With
+`fixed_cves`, only the items whose CVE (`vulnerability.id`) is in that list are
+resolved.
+
+ServiceNow access: the API Access Policy must cover the Table API resources
+`/now/table/{tableName}` (GET) and `/now/table/{tableName}/{sys_id}` (PATCH)
+for `sn_vul_vulnerable_item`, and the key's user needs write access to it.
 
 ```yaml
 vulnerable_item_sys_id: ae292f5d47bb8b105f8e370cd36d4365,66292f5d47bb8b105f8e370cd36d436a
@@ -197,12 +221,7 @@ fixed_cves: [CVE-2025-71116, CVE-2025-71147]        # optional
 | `vulnerable_item_sys_id` | required | sys_ids of the vulnerable items (comma-separated, or a list); `vulnerable_item_sys_ids` also works |
 | `fixed_cves` | empty | Only resolve items with these CVEs (list, or comma-separated) |
 | `cmdb_ci_sys_id` | empty | Only resolve items of this CI |
-| `remtask_sys_id` | empty | Remediation task to set to Resolved once all items are Resolved |
 | `snow_vi_resolved_state` | `Resolved` | State label to set on the items (label, not number) |
-| `snow_batch_size` | `100` | Items per Batch API call; lower it if requests come back unserviced |
-| `snow_batch_timeout` | `300` | Seconds one Batch API call may take |
-| `snow_remtask_table` | `sn_vul_vulnerability` | Table of the remediation task |
-| `snow_remtask_resolved_state` | `Resolved` | State label to set on the task |
 
 ## CMDB configuration item (`register-cmdb-ci.yml`)
 
