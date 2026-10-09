@@ -18,9 +18,7 @@
 #       fixed_cves: optional, list of CVE ids (or a comma-separated string)
 #       cmdb_ci_sys_id: optional, only items of this CI
 #       remtask_sys_id: optional, sys_id of the remediation task to resolve
-# ServiceNow access: the items are updated through the Batch API
-# (POST /now/v1/batch, one call per snow_batch_size items), so the API Access
-# Policy must cover that API; the user needs write access to
+# Same ServiceNow access as resolve-vulnerable-item.yml: write access to
 # sn_vul_vulnerable_item, plus read access to the vulnerability records
 # (vulnerability.id is dot-walked). With remtask_sys_id also read/write on the
 # remediation task table (Table API GET/PATCH /now/table/{tableName}/{sys_id}).
@@ -40,10 +38,9 @@
     snow_vi_api: "{{ snow_host }}/api/now/table/{{ snow_vi_table }}"
     # Choice label, not number (sysparm_input_display_value=true).
     snow_vi_resolved_state: Resolved
-    # Items per Batch API call, and how long one call may take: ServiceNow
-    # runs the sub-requests one after the other.
-    snow_batch_size: 100
-    snow_batch_timeout: 300
+    snow_vi_work_note: >-
+      Remediated by Ansible Automation Platform (job {{ tower_job_id | default('n/a') }}):
+      {{ item.cve or 'vulnerability' }} {{ 'fixed' if fixed_cve_list else 'remediated' }}.
     # sys_ids per lookup call: 100 keeps the URL around 3.5 KB.
     snow_query_batch: 100
     cmdb_ci_sys_id: ""
@@ -169,114 +166,47 @@
           {{ snow_vi_table }} records: {{ vi_not_found | join(', ') | truncate(500) }}
         quiet: true
 
-    # One Batch API call per snow_batch_size items instead of one PATCH each:
-    # every sub-request is a Table API PATCH, its body base64 encoded.
-    # /api/now/v1/batch itself is a public page that runs as guest, and each
-    # sub-request is authenticated on its own headers, so every sub-request
-    # carries the API key; without it the Table API answers 401.
     - name: Set the fixed vulnerable items to {{ snow_vi_resolved_state }}
       ansible.builtin.uri:
-        url: "{{ snow_host }}/api/now/v1/batch"
-        method: POST
+        url: >-
+          {{ snow_vi_api }}/{{ item.sys_id }}?sysparm_input_display_value=true&sysparm_display_value=true&sysparm_fields=number,state
+        method: PATCH
         headers: "{{ snow_headers }}"
         body_format: json
         body:
-          batch_request_id: "{{ tower_job_id | default('manual') }}-{{ batch_index }}"
-          rest_requests: "{{ batch_requests }}"
-        timeout: "{{ snow_batch_timeout }}"
-      register: vi_batches
-      loop: "{{ fixed_items | rejectattr('state', 'eq', snow_vi_resolved_state) | batch(snow_batch_size) | list }}"
+          state: "{{ snow_vi_resolved_state }}"
+          work_notes: "{{ snow_vi_work_note }}"
+      register: vi_updates
+      loop: "{{ fixed_items | rejectattr('state', 'eq', snow_vi_resolved_state) | list }}"
       loop_control:
-        index_var: batch_index
-        label: "batch {{ batch_index + 1 }}: {{ item | length }} items"
-      vars:
-        batch_requests: >-
-          {%- set out = [] -%}
-          {%- for vi in item -%}
-            {%- set _ = out.append({
-                  'id': vi.sys_id,
-                  'method': 'PATCH',
-                  'url': '/api/now/table/' ~ snow_vi_table ~ '/' ~ vi.sys_id
-                         ~ '?sysparm_input_display_value=true&sysparm_display_value=true&sysparm_fields=number,state',
-                  'headers': [{'name': 'Content-Type', 'value': 'application/json'},
-                              {'name': 'Accept', 'value': 'application/json'},
-                              {'name': 'x-sn-apikey', 'value': snow_api_key}],
-                  'exclude_response_headers': true,
-                  'body': ({'state': snow_vi_resolved_state,
-                            'work_notes': 'Remediated by Ansible Automation Platform (job '
-                                          ~ (tower_job_id | default('n/a')) ~ '): '
-                                          ~ (vi.cve or 'vulnerability') ~ ' '
-                                          ~ ('fixed' if fixed_cve_list else 'remediated') ~ '.'}
-                           | to_json | b64encode)}) -%}
-          {%- endfor -%}
-          {{ out }}
-      changed_when: vi_batches.status | default(0) == 200
+        label: "{{ item.number }} {{ item.cve }}"
+      changed_when: vi_updates.status | default(0) == 200
       failed_when: false
       no_log: true
 
-    # One entry per item sent: the sub-request status and the state stored
-    # afterwards. Business rules or ACLs can keep the old state while the API
-    # still answers 200, and requests ServiceNow did not get to before its
-    # batch timeout come back as unserviced.
-    - name: Collect the vulnerable item updates
-      ansible.builtin.set_fact:
-        vi_updates: "{{ vi_update_list }}"
-      vars:
-        vi_numbers: "{{ dict(fixed_items | map(attribute='sys_id') | zip(fixed_items | map(attribute='number'))) }}"
-        vi_update_list: >-
-          {%- set out = [] -%}
-          {%- for b in vi_batches.results | default([]) -%}
-            {%- set resp = b.json | default({}) if b.json | default({}) is mapping else {} -%}
-            {%- set seen = [] -%}
-            {%- for r in resp.serviced_requests | default([]) -%}
-              {%- set body = (r.body | b64decode | from_json) if r.body | default('') | length > 0 else {} -%}
-              {%- set _ = seen.append(r.id) -%}
-              {%- set _ = out.append({
-                    'sys_id': r.id,
-                    'number': vi_numbers[r.id] | default(r.id),
-                    'status': r.status_code | int,
-                    'state': (body.result.state | default('')) if body.result is defined and body.result is mapping else '',
-                    'error': ([body.error.message | default(''), body.error.detail | default('')] | select | join(': '))
-                             if body.error is defined and body.error is mapping else ''}) -%}
-            {%- endfor -%}
-            {#- Requests without an answer: unserviced, or the whole batch call failed. -#}
-            {%- for vi in b.item if vi.sys_id not in seen -%}
-              {%- set _ = out.append({
-                    'sys_id': vi.sys_id,
-                    'number': vi.number,
-                    'status': b.status | default(-1) if b.status | default(-1) != 200 else 0,
-                    'state': '',
-                    'error': (resp.error.message | default(b.msg | default('')))
-                             if b.status | default(-1) != 200 else 'not serviced (batch timeout)'}) -%}
-            {%- endfor -%}
-          {%- endfor -%}
-          {{ out }}
-
+    # Business rules or ACLs can silently keep the old state while the API
+    # still answers 200, so check what was actually stored.
     - name: Report the result
       ansible.builtin.assert:
         that: vi_failed | length == 0
         fail_msg: >-
-          {{ vi_failed | length }} of {{ vi_updates | length }} item(s) not resolved:
-          {{ vi_failed | map(attribute='number') | join(', ') | truncate(300) }}
-          (HTTP {{ vi_failed | map(attribute='status') | unique | join(', ') }}
-          {%- if vi_errors %}: {{ vi_errors | join('; ') | truncate(300) }}{% endif %}).
-          {{ 'HTTP 401: the API Access Policy must cover the Batch API (/now/v1/batch). '
-             if 401 in vi_failed | map(attribute='status') else '' -}}
-          {{ 'HTTP 0: ServiceNow did not service these requests in time; lower snow_batch_size. '
-             if 0 in vi_failed | map(attribute='status') else '' -}}
-          A 200 here means a business rule, ACL or missing role kept the old state.
+          {{ vi_failed | length }} item(s) not resolved:
+          {{ vi_failed | map(attribute='item.number') | join(', ') }}
+          (HTTP {{ vi_failed | map(attribute='status') | unique | join(', ') }}; a 200 here means
+          a business rule, ACL or missing role kept the old state).
         success_msg: >-
           {{ task_items | length }} vulnerable items,
           {{ (fixed_items | length ~ ' match the ' ~ fixed_cve_list | length ~ ' fixed CVEs:')
              if fixed_cve_list else 'all to resolve:' }}
           {{ vi_resolved | length }} set to {{ snow_vi_resolved_state }}
-          in {{ vi_batches.results | default([]) | length }} batch call(s),
-          {{ fixed_items | length - vi_updates | length }} already {{ snow_vi_resolved_state }}.
+          ({{ vi_resolved | map(attribute='item.number') | join(', ') or 'none' }}),
+          {{ fixed_items | length - vi_updates.results | length }} already {{ snow_vi_resolved_state }}.
           {{ ('Fixed CVEs not in these items: ' ~ cves_missing | join(', ') ~ '.') if cves_missing else '' }}
       vars:
-        vi_resolved: "{{ vi_updates | selectattr('status', 'eq', 200) | selectattr('state', 'eq', snow_vi_resolved_state) | list }}"
-        vi_failed: "{{ vi_updates | difference(vi_resolved) }}"
-        vi_errors: "{{ vi_failed | map(attribute='error') | select | unique | list }}"
+        vi_resolved: >-
+          {{ vi_updates.results | selectattr('status', 'eq', 200)
+             | selectattr('json.result.state', 'eq', snow_vi_resolved_state) | list }}
+        vi_failed: "{{ vi_updates.results | difference(vi_resolved) }}"
         cves_missing: "{{ fixed_cve_list | difference(task_items | map(attribute='cve')) }}"
 
     # --- Remediation task ---------------------------------------------------
@@ -287,9 +217,9 @@
       ansible.builtin.set_fact:
         vi_still_open: >-
           {{ task_items | rejectattr('state', 'eq', snow_vi_resolved_state)
-             | rejectattr('sys_id', 'in', vi_updates | selectattr('status', 'eq', 200)
-                          | selectattr('state', 'eq', snow_vi_resolved_state)
-                          | map(attribute='sys_id') | list)
+             | rejectattr('sys_id', 'in', vi_updates.results | selectattr('status', 'eq', 200)
+                          | selectattr('json.result.state', 'eq', snow_vi_resolved_state)
+                          | map(attribute='item.sys_id') | list)
              | list }}
       when: remtask_before is not skipped
 
