@@ -170,8 +170,10 @@
         quiet: true
 
     # One Batch API call per snow_batch_size items instead of one PATCH each:
-    # every sub-request is a Table API PATCH, its body base64 encoded, and the
-    # whole batch runs as the API key's user.
+    # every sub-request is a Table API PATCH, its body base64 encoded.
+    # /api/now/v1/batch itself is a public page that runs as guest, and each
+    # sub-request is authenticated on its own headers, so every sub-request
+    # carries the API key; without it the Table API answers 401.
     - name: Set the fixed vulnerable items to {{ snow_vi_resolved_state }}
       ansible.builtin.uri:
         url: "{{ snow_host }}/api/now/v1/batch"
@@ -197,7 +199,8 @@
                   'url': '/api/now/table/' ~ snow_vi_table ~ '/' ~ vi.sys_id
                          ~ '?sysparm_input_display_value=true&sysparm_display_value=true&sysparm_fields=number,state',
                   'headers': [{'name': 'Content-Type', 'value': 'application/json'},
-                              {'name': 'Accept', 'value': 'application/json'}],
+                              {'name': 'Accept', 'value': 'application/json'},
+                              {'name': 'x-sn-apikey', 'value': snow_api_key}],
                   'exclude_response_headers': true,
                   'body': ({'state': snow_vi_resolved_state,
                             'work_notes': 'Remediated by Ansible Automation Platform (job '

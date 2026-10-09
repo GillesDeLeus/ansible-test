@@ -175,8 +175,10 @@ Remediation job template:
 - Extra variables: "Prompt on launch", so the launch API accepts
   `vulnerable_item_sys_id`.
 - ServiceNow access: the API Access Policy must cover the Table API resources
-  `/now/table/{tableName}` (GET) for `sn_vul_vulnerable_item` and the Batch
-  API (`/now/v1/batch`), and `/now/table/{tableName}/{sys_id}` (GET and
+  `/now/table/{tableName}` (GET) and `/now/table/{tableName}/{sys_id}` (PATCH)
+  for `sn_vul_vulnerable_item`: the Batch API (`/now/v1/batch`) is a public
+  page that runs as guest and needs no policy, but every PATCH inside it is
+  authenticated separately, so the playbook sends the API key in each one. And `/now/table/{tableName}/{sys_id}` (GET and
   PATCH) for the remediation task table (`sn_vul_vulnerability`) when
   `remtask_sys_id` is sent. The key's user needs write access to both
   (e.g. `sn_vul.remediation_owner`).
