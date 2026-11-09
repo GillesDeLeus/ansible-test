@@ -10,3 +10,8 @@ collections:
     version: ">=2.0.0,<3.0.0"
   - name: redhat.rhel_system_roles
   - name: ansible.controller
+  # Satellite demo (satellite-demo.yml)
+  - name: redhat.satellite
+  - name: community.general
+  - name: ansible.posix
+  - name: containers.podman

@@ -1,0 +1,96 @@
+---
+# End to end: a Satellite VM with local Lightspeed, plus one RHEL client VM
+# registered to it. Both run on OpenShift Virtualization in rhel-vms.
+#
+# Credentials on the job template:
+#   - OpenShift or Kubernetes API Bearer Token (aap-vm-provisioner)
+#   - Machine (cloud-user + private key, sudo)
+#   - Red Hat Activation Key   (registers the Satellite VM itself with the CDN)
+#   - Red Hat Satellite        (aap/credential-type-satellite.yml)
+# Extra vars: satellite_fqdn, vm_ssh_public_key, optional client_vm_name.
+# Set the job template timeout to 0 or >= 3h: the installer alone takes 30-60 min.
+
+- name: Provision and configure the Satellite server
+  ansible.builtin.import_playbook: provision-satellite.yml
+
+- name: Create the client VM
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    client_vm_name: satellite-client
+    vm_namespace: rhel-vms
+    vm_instancetype: u1.medium
+    vm_user: cloud-user
+
+  tasks:
+    - name: Create or update the client VirtualMachine
+      kubevirt.core.kubevirt_vm:
+        state: present
+        name: "{{ client_vm_name }}"
+        namespace: "{{ vm_namespace }}"
+        labels:
+          app: "{{ client_vm_name }}"
+          provisioned-by: aap
+        instancetype:
+          name: "{{ vm_instancetype }}"
+        preference:
+          name: rhel.9
+        data_volume_templates:
+          - metadata:
+              name: "{{ client_vm_name }}-rootdisk"
+            spec:
+              sourceRef:
+                kind: DataSource
+                name: rhel9
+                namespace: openshift-virtualization-os-images
+              storage:
+                resources:
+                  requests:
+                    storage: 30Gi
+        spec:
+          domain:
+            devices: {}
+          volumes:
+            - name: rootdisk
+              dataVolume:
+                name: "{{ client_vm_name }}-rootdisk"
+            - name: cloudinitdisk
+              cloudInitNoCloud:
+                userData: |-
+                  #cloud-config
+                  hostname: {{ client_vm_name }}
+                  fqdn: {{ client_vm_name }}
+                  user: {{ vm_user }}
+                  ssh_pwauth: false
+                  disable_root: true
+                  ssh_authorized_keys:
+                    - {{ vm_ssh_public_key }}
+                  runcmd:
+                    - systemctl enable --now qemu-guest-agent
+        wait: true
+        wait_timeout: 900
+
+    - name: Wait for the client VM to report an IP address
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ client_vm_name }}"
+        namespace: "{{ vm_namespace }}"
+      register: vmi
+      until: >-
+        vmi.resources | length > 0
+        and (vmi.resources[0].status.interfaces | default([]) | selectattr('ipAddress', 'defined') | list | length > 0)
+      retries: 60
+      delay: 10
+
+    - name: Add the client VM to the in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ client_vm_name }}"
+        groups: new_vms
+        ansible_host: "{{ (vmi.resources[0].status.interfaces | selectattr('ipAddress', 'defined') | first).ipAddress }}"
+        ansible_user: "{{ vm_user }}"
+
+- name: Register the client VM to Satellite
+  ansible.builtin.import_playbook: register-to-satellite.yml

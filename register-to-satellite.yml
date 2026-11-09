@@ -1,0 +1,100 @@
+---
+# Register RHEL VMs to the Satellite from provision-satellite.yml instead of
+# console.redhat.com. Uses Satellite's global registration, which installs the
+# Katello CA, registers with subscription-manager and configures insights-client
+# to upload to Satellite (local Lightspeed).
+#
+# Runs against target_hosts (default: new_vms, the group satellite-demo.yml and
+# provision-vm.yml add to). Standalone, point target_hosts at an inventory group.
+# Needs: satellite_fqdn, satellite_admin_password (Red Hat Satellite credential),
+# the OpenShift bearer-token credential (to look up the Satellite Service IP).
+
+- name: Look up the Satellite Service address
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    satellite_vm_name: satellite
+    satellite_vm_namespace: rhel-vms
+
+  tasks:
+    # Clients reach Satellite on its ClusterIP instead of the router: no
+    # dependency on *.apps DNS or router hairpinning from inside the cluster.
+    - name: Read the Satellite Service
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Service
+        name: "{{ satellite_vm_name }}"
+        namespace: "{{ satellite_vm_namespace }}"
+      register: sat_svc
+      failed_when: sat_svc.resources | length == 0
+
+    - name: Remember the ClusterIP
+      ansible.builtin.set_fact:
+        satellite_service_ip: "{{ sat_svc.resources[0].spec.clusterIP }}"
+
+- name: Register the VMs to Satellite
+  hosts: "{{ target_hosts | default('new_vms') }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    satellite_org: "{{ satellite_organization | default('Devoteam Demo') }}"
+    satellite_ak: "{{ satellite_activation_key | default('demo-rhel9') }}"
+    sat_api: "{{ satellite_api_url | default('https://' ~ satellite_fqdn) }}"
+
+  tasks:
+    - name: Wait until SSH is available
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+        delay: 10
+
+    - name: Resolve the Satellite FQDN to its Service IP
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '\s{{ satellite_fqdn | regex_escape }}(\s|$)'
+        line: "{{ hostvars['localhost'].satellite_service_ip }} {{ satellite_fqdn }}"
+
+    - name: Generate the global registration command
+      redhat.satellite.registration_command:
+        server_url: "{{ sat_api }}"
+        username: admin
+        password: "{{ satellite_admin_password }}"
+        validate_certs: false
+        organization: "{{ satellite_org }}"
+        activation_keys: ["{{ satellite_ak }}"]
+        insecure: true              # fetch the Katello CA without verifying it first
+        setup_insights: true
+        setup_remote_execution: true
+        force: true                 # re-register hosts currently registered to the CDN
+      delegate_to: localhost
+      become: false
+      run_once: true
+      no_log: true                  # the command embeds a JWT
+      register: reg
+
+    - name: Check whether this host is already registered to this Satellite
+      ansible.builtin.shell: set -o pipefail && subscription-manager config --list | grep -E '^\s*hostname = '
+      register: rhsm_host
+      changed_when: false
+      failed_when: false
+
+    - name: Drop any CDN / console.redhat.com registration
+      ansible.builtin.shell: |
+        insights-client --unregister || true
+        rhc disconnect || true
+        subscription-manager unregister || true
+        subscription-manager clean
+      when: satellite_fqdn not in rhsm_host.stdout
+      changed_when: true
+
+    - name: Register to Satellite
+      ansible.builtin.shell: "{{ reg.registration_command }}"
+      when: satellite_fqdn not in rhsm_host.stdout
+      changed_when: true
+      no_log: true
+
+    - name: Upload a report to local Lightspeed
+      ansible.builtin.command: insights-client
+      changed_when: false

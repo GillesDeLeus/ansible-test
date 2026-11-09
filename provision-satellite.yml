@@ -1,0 +1,425 @@
+---
+# Provision a Red Hat Satellite 6.19 server on OpenShift Virtualization with
+# Red Hat Lightspeed in Satellite (local advisor + vulnerability, "IOP").
+# Hosts registered to this Satellite upload their Insights archives here and
+# are analysed locally; nothing is reported to console.redhat.com.
+#
+# Job template requirements:
+#   - Credential: "OpenShift or Kubernetes API Bearer Token"  -> K8S_AUTH_* env vars
+#     (same aap-vm-provisioner SA; it also needs create/patch on services and
+#     routes.route.openshift.io in vm_namespace)
+#   - Credential: Machine (user cloud-user, private key, become sudo)
+#   - Credential: custom "Red Hat Activation Key" -> rhc_org_id / rhc_activation_key
+#     The key's org must have a Red Hat Satellite subscription (Satellite repos).
+#   - Credential: custom "Red Hat Satellite" (aap/credential-type-satellite.yml)
+#       -> satellite_admin_password, registry_username / registry_password
+#          (registry.redhat.io, IOP images), satellite_manifest_b64
+#   - Extra vars / survey:
+#       satellite_fqdn            e.g. satellite.apps.<cluster-domain> (must be
+#                                 covered by the cluster's *.apps wildcard DNS)
+#       vm_ssh_public_key
+#       satellite_api_url         optional; default https://<satellite_fqdn>.
+#                                 Set https://satellite.rhel-vms.svc if the job pod
+#                                 cannot reach the router's own *.apps address.
+#   - Manifest: satellite_manifest_b64 (base64 of the .zip, from the credential)
+#     or satellite_manifest_path (file in the project). From
+#     console.redhat.com > Subscriptions > Manifests. Required: without it there
+#     is no RHEL content and no activation key, so clients cannot register.
+# Collections: kubevirt.core, kubernetes.core, redhat.rhel_system_roles,
+#   community.general, ansible.posix, containers.podman, redhat.satellite
+#
+# Install time: expect 30-60 minutes for satellite-installer + IOP.
+
+- name: Create the Satellite VM, Service and Route on OpenShift Virtualization
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    vm_name: satellite
+    vm_namespace: rhel-vms
+    vm_instancetype: u1.2xlarge          # 8 vCPU / 32 GiB: Satellite + local Lightspeed
+    vm_preference: rhel.9                # Satellite 6.19 runs on RHEL 9
+    vm_os_datasource: rhel9
+    vm_os_datasource_namespace: openshift-virtualization-os-images
+    vm_root_disk_size: 80Gi
+    vm_data_disk_size: 150Gi             # /var/lib/pulp; on_demand download policy keeps this small
+    vm_storage_class: ""                 # empty = cluster default
+    vm_user: cloud-user
+
+  tasks:
+    - name: Check required variables
+      ansible.builtin.assert:
+        that:
+          - satellite_fqdn is defined and satellite_fqdn is match('^[a-z0-9.-]+$')
+          - vm_ssh_public_key is defined and vm_ssh_public_key | length > 0
+          - satellite_admin_password is defined and satellite_admin_password | length >= 8
+          - registry_username is defined and registry_password is defined
+          - satellite_manifest_b64 is defined or satellite_manifest_path is defined
+        fail_msg: >-
+          Set satellite_fqdn (lowercase), vm_ssh_public_key, satellite_admin_password,
+          registry_username/registry_password and a manifest
+          (satellite_manifest_b64 or satellite_manifest_path).
+
+    - name: Build the storage spec once
+      ansible.builtin.set_fact:
+        sc_override: "{{ {'storageClassName': vm_storage_class} if vm_storage_class | length > 0 else {} }}"
+
+    - name: Create or update the Satellite VirtualMachine
+      kubevirt.core.kubevirt_vm:
+        state: present
+        name: "{{ vm_name }}"
+        namespace: "{{ vm_namespace }}"
+        labels:
+          app: "{{ vm_name }}"
+          provisioned-by: aap
+        instancetype:
+          name: "{{ vm_instancetype }}"
+        preference:
+          name: "{{ vm_preference }}"
+        data_volume_templates:
+          - metadata:
+              name: "{{ vm_name }}-rootdisk"
+            spec:
+              sourceRef:
+                kind: DataSource
+                name: "{{ vm_os_datasource }}"
+                namespace: "{{ vm_os_datasource_namespace }}"
+              storage: "{{ {'resources': {'requests': {'storage': vm_root_disk_size}}} | combine(sc_override) }}"
+          - metadata:
+              name: "{{ vm_name }}-pulpdata"
+            spec:
+              source:
+                blank: {}
+              storage: "{{ {'resources': {'requests': {'storage': vm_data_disk_size}}} | combine(sc_override) }}"
+        spec:
+          domain:
+            devices:
+              disks:
+                - name: rootdisk
+                  disk: {bus: virtio}
+                - name: pulpdata
+                  serial: pulpdata          # -> /dev/disk/by-id/virtio-pulpdata
+                  disk: {bus: virtio}
+                - name: cloudinitdisk
+                  disk: {bus: virtio}
+          volumes:
+            - name: rootdisk
+              dataVolume:
+                name: "{{ vm_name }}-rootdisk"
+            - name: pulpdata
+              dataVolume:
+                name: "{{ vm_name }}-pulpdata"
+            - name: cloudinitdisk
+              cloudInitNoCloud:
+                userData: |-
+                  #cloud-config
+                  hostname: {{ satellite_fqdn.split('.')[0] }}
+                  fqdn: {{ satellite_fqdn }}
+                  prefer_fqdn_over_hostname: true
+                  user: {{ vm_user }}
+                  ssh_pwauth: false
+                  disable_root: true
+                  ssh_authorized_keys:
+                    - {{ vm_ssh_public_key }}
+                  runcmd:
+                    - systemctl enable --now qemu-guest-agent
+        wait: true
+        wait_timeout: 900
+
+    # virt-launcher pods carry vm.kubevirt.io/name automatically.
+    - name: Expose Satellite inside the cluster
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ vm_name }}"
+            namespace: "{{ vm_namespace }}"
+          spec:
+            selector:
+              vm.kubevirt.io/name: "{{ vm_name }}"
+            ports:
+              - {name: https, port: 443, targetPort: 443}
+              - {name: http, port: 80, targetPort: 80}
+      register: sat_svc
+
+    # Passthrough keeps Satellite's own (Katello) certificate end to end, so the
+    # browser and clients see the same FQDN the installer configured.
+    - name: Expose Satellite on its FQDN through the router (passthrough TLS)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: route.openshift.io/v1
+          kind: Route
+          metadata:
+            name: "{{ vm_name }}"
+            namespace: "{{ vm_namespace }}"
+          spec:
+            host: "{{ satellite_fqdn }}"
+            to: {kind: Service, name: "{{ vm_name }}"}
+            port: {targetPort: https}
+            tls: {termination: passthrough}
+
+    - name: Wait for the VM to report an IP address (needs qemu-guest-agent)
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ vm_name }}"
+        namespace: "{{ vm_namespace }}"
+      register: vmi
+      until: >-
+        vmi.resources | length > 0
+        and (vmi.resources[0].status.interfaces | default([]) | selectattr('ipAddress', 'defined') | list | length > 0)
+      retries: 60
+      delay: 10
+
+    - name: Add the Satellite VM to the in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ vm_name }}"
+        groups: satellite_servers
+        ansible_host: "{{ (vmi.resources[0].status.interfaces | selectattr('ipAddress', 'defined') | first).ipAddress }}"
+        ansible_user: "{{ vm_user }}"
+        satellite_service_ip: "{{ sat_svc.result.spec.clusterIP }}"
+
+- name: Install Satellite with Red Hat Lightspeed in Satellite
+  hosts: satellite_servers
+  gather_facts: false
+  become: true
+
+  vars:
+    satellite_version: "6.19"
+    satellite_org: "{{ satellite_organization | default('Devoteam Demo') }}"
+    satellite_loc: "{{ satellite_location | default('OpenShift') }}"
+
+  tasks:
+    - name: Wait until SSH is available
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+        delay: 10
+
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
+    # satellite-installer requires the FQDN to resolve. Point it at the guest's
+    # own address: with the default masquerade binding that is always 10.0.2.2,
+    # so it survives restarts. Not the Service IP: Satellite talks to itself on
+    # ports the Service does not expose (9090 smart proxy, etc.).
+    - name: Set the FQDN as hostname
+      ansible.builtin.hostname:
+        name: "{{ satellite_fqdn }}"
+
+    - name: Resolve the FQDN to the VM's own address
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '\s{{ satellite_fqdn | regex_escape }}(\s|$)'
+        line: "{{ ansible_facts.default_ipv4.address }} {{ satellite_fqdn }} {{ satellite_fqdn.split('.')[0] }}"
+
+    - name: Register the Satellite VM itself with Red Hat (CDN)
+      ansible.builtin.include_role:
+        name: redhat.rhel_system_roles.rhc
+      vars:
+        rhc_state: present
+        rhc_organization: "{{ rhc_org_id }}"
+        rhc_auth:
+          activation_keys:
+            keys:
+              - "{{ rhc_activation_key }}"
+        rhc_insights:
+          state: absent            # this host is the Lightspeed server, not a client
+        # No release pin: the golden image is already on the latest RHEL 9 minor
+        # and pinning lower blocks dependency resolution for satellite.
+
+    - name: Enable only the repositories Satellite needs
+      community.general.rhsm_repository:
+        name:
+          - rhel-9-for-x86_64-baseos-rpms
+          - rhel-9-for-x86_64-appstream-rpms
+          - "satellite-{{ satellite_version }}-for-rhel-9-x86_64-rpms"
+          - "satellite-maintenance-{{ satellite_version }}-for-rhel-9-x86_64-rpms"
+        purge: true
+        state: enabled
+
+    - name: Prepare the Pulp data disk
+      community.general.filesystem:
+        dev: /dev/disk/by-id/virtio-pulpdata
+        fstype: xfs
+
+    - name: Mount the Pulp data disk on /var/lib/pulp
+      ansible.posix.mount:
+        path: /var/lib/pulp
+        src: /dev/disk/by-id/virtio-pulpdata
+        fstype: xfs
+        opts: defaults
+        state: mounted
+
+    - name: Update the system
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+      register: dnf_update
+
+    - name: Reboot if the update requires it
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+      when: dnf_update is changed
+
+    - name: Install the Satellite packages (and podman for the IOP containers)
+      ansible.builtin.dnf:
+        name: [satellite, podman]
+        state: present
+
+    # The freshly made filesystem has no SELinux labels yet.
+    - name: Restore SELinux labels on /var/lib/pulp
+      ansible.builtin.command: restorecon -R /var/lib/pulp
+      changed_when: false
+
+    - name: Read service state
+      ansible.builtin.service_facts:
+
+    - name: Open the Satellite ports when firewalld is running
+      ansible.posix.firewalld:
+        service: RH-Satellite-6
+        permanent: true
+        immediate: true
+        state: enabled
+      when: ansible_facts.services['firewalld.service'].state | default('') == 'running'
+
+    - name: Check that this installer knows --enable-iop
+      ansible.builtin.shell: set -o pipefail && satellite-installer --full-help | grep -q -- '--\[no-\]enable-iop'
+      changed_when: false
+
+    - name: Run satellite-installer (base install)
+      ansible.builtin.command: >-
+        satellite-installer --scenario satellite
+        --foreman-initial-organization "{{ satellite_org }}"
+        --foreman-initial-location "{{ satellite_loc }}"
+        --foreman-initial-admin-username admin
+        --foreman-initial-admin-password "{{ satellite_admin_password }}"
+      args:
+        creates: /root/.satellite-installed
+      async: 5400
+      poll: 30
+      no_log: true
+      register: sat_install
+
+    - name: Mark the base install as done
+      ansible.builtin.file:
+        path: /root/.satellite-installed
+        state: touch
+        modification_time: preserve
+        access_time: preserve
+      when: sat_install is changed
+
+    # The IOP containers come from registry.redhat.io.
+    - name: Log in to registry.redhat.io for the Lightspeed images
+      containers.podman.podman_login:
+        registry: registry.redhat.io
+        username: "{{ registry_username }}"
+        password: "{{ registry_password }}"
+      no_log: true
+
+    - name: Enable Red Hat Lightspeed in Satellite (local advisor + vulnerability)
+      ansible.builtin.command: satellite-installer --enable-iop
+      args:
+        creates: /root/.satellite-iop-enabled
+      async: 3600
+      poll: 30
+      register: iop_install
+
+    - name: Mark IOP as enabled
+      ansible.builtin.file:
+        path: /root/.satellite-iop-enabled
+        state: touch
+        modification_time: preserve
+        access_time: preserve
+      when: iop_install is changed
+
+    - name: Check that the local Lightspeed containers are running
+      ansible.builtin.shell: set -o pipefail && systemctl list-units 'iop-*' --no-legend | grep -c running
+      register: iop_units
+      changed_when: false
+
+    - name: Show IOP status
+      ansible.builtin.debug:
+        msg: "{{ iop_units.stdout }} iop-* units running. UI: https://{{ satellite_fqdn }} > Red Hat Lightspeed"
+
+- name: Load content and create an activation key for the demo VMs
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    sat_api: "{{ satellite_api_url | default('https://' ~ satellite_fqdn) }}"
+
+  module_defaults:
+    group/redhat.satellite.satellite:
+      server_url: "{{ sat_api }}"
+      username: admin
+      password: "{{ satellite_admin_password }}"
+      validate_certs: false          # Katello self-signed CA; import it in AAP to switch this on
+      organization: "{{ satellite_organization | default('Devoteam Demo') }}"
+
+  tasks:
+    - name: Wait for the Satellite API
+      ansible.builtin.uri:
+        url: "{{ sat_api }}/api/status"
+        user: admin
+        password: "{{ satellite_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: sat_status
+      until: sat_status.status == 200
+      retries: 30
+      delay: 10
+      no_log: true
+
+    # Binary zip: decode with base64, not the b64decode filter (text only).
+    - name: Write the manifest from the credential
+      ansible.builtin.shell: base64 -di > /tmp/satellite-manifest.zip
+      args:
+        stdin: "{{ satellite_manifest_b64 }}"
+      when: satellite_manifest_b64 is defined
+      changed_when: false
+      no_log: true
+
+    - name: Upload the subscription manifest
+      redhat.satellite.subscription_manifest:
+        manifest_path: "{{ '/tmp/satellite-manifest.zip' if satellite_manifest_b64 is defined else satellite_manifest_path }}"
+        state: present
+
+    # Content is only downloaded when a client asks for it.
+    - name: Use on_demand for Red Hat repositories
+      redhat.satellite.setting:
+        name: default_redhat_download_policy
+        value: on_demand
+
+    # RHEL 9 repo sets have a $releasever substitution; "9" = latest minor.
+    - name: Enable RHEL 9 BaseOS and AppStream
+      redhat.satellite.repository_set:
+        product: Red Hat Enterprise Linux for x86_64
+        name: "{{ item }}"
+        repositories:
+          - basearch: x86_64
+            releasever: "9"
+        state: enabled
+      loop:
+        - Red Hat Enterprise Linux 9 for x86_64 - BaseOS (RPMs)
+        - Red Hat Enterprise Linux 9 for x86_64 - AppStream (RPMs)
+
+    - name: Sync the RHEL product (metadata only with on_demand)
+      redhat.satellite.repository_sync:
+        product: Red Hat Enterprise Linux for x86_64
+
+    - name: Create the activation key for demo VMs
+      redhat.satellite.activation_key:
+        name: "{{ satellite_activation_key | default('demo-rhel9') }}"
+        lifecycle_environment: Library
+        content_view: Default Organization View
+        state: present
