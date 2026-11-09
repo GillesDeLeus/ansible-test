@@ -335,13 +335,38 @@
         access_time: preserve
       when: sat_install is changed
 
-    # The IOP containers come from registry.redhat.io.
+    # The IOP containers come from registry.redhat.io and are pulled by root,
+    # both by the installer and by the iop-* systemd units on every start.
+    # Store the login in root's persistent auth file (the default under /run
+    # is not what those see, and is wiped on reboot).
     - name: Log in to registry.redhat.io for the Lightspeed images
       containers.podman.podman_login:
         registry: registry.redhat.io
         username: "{{ registry_username }}"
         password: "{{ registry_password }}"
+        authfile: "{{ item }}"
+      loop:
+        - /root/.config/containers/auth.json
+        - /run/containers/0/auth.json
       no_log: true
+
+    # Fails in seconds with a clear message instead of 20+ installer errors.
+    - name: Check that the registry login can pull a Lightspeed image
+      ansible.builtin.command: >-
+        podman pull --quiet registry.redhat.io/satellite/iop-gateway-rhel9:{{ satellite_version }}
+      environment:
+        REGISTRY_AUTH_FILE: /root/.config/containers/auth.json
+      changed_when: false
+      register: iop_pull
+      failed_when: false
+
+    - name: Stop if registry.redhat.io refuses the credentials
+      ansible.builtin.fail:
+        msg: >-
+          Pulling from registry.redhat.io failed: {{ iop_pull.stderr | default('') | trim }}.
+          Check the registry service account username/token in the "Red Hat Satellite"
+          credential (access.redhat.com/terms-based-registry).
+      when: iop_pull.rc != 0
 
     - name: Enable Red Hat Lightspeed in Satellite (local advisor + vulnerability)
       ansible.builtin.command: satellite-installer --scenario satellite --enable-iop
