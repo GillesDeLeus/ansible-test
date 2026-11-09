@@ -457,15 +457,15 @@
         name: default_redhat_download_policy
         value: on_demand
 
-    # RHEL 9 repo sets have a $releasever substitution; "9" = latest minor.
+    # RHEL 9 repo sets only substitute $releasever (the arch is fixed by the
+    # product); "9" = always the latest minor.
     - name: Enable RHEL 9 BaseOS and AppStream
       redhat.satellite.repository_set:
         organization: "{{ sat_org }}"
         product: Red Hat Enterprise Linux for x86_64
         name: "{{ item }}"
         repositories:
-          - basearch: x86_64
-            releasever: "9"
+          - releasever: "9"
         state: enabled
       loop:
         - Red Hat Enterprise Linux 9 for x86_64 - BaseOS (RPMs)
