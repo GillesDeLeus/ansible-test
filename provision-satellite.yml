@@ -335,10 +335,10 @@
         access_time: preserve
       when: sat_install is changed
 
-    # The IOP containers come from registry.redhat.io and are pulled by root,
-    # both by the installer and by the iop-* systemd units on every start.
-    # Store the login in root's persistent auth file (the default under /run
-    # is not what those see, and is wiped on reboot).
+    # The IOP containers come from registry.redhat.io. The installer and the
+    # iop-* systemd units read the login from /etc/foreman/registry-auth.json,
+    # not from podman's default auth files. Root's own file is kept for manual
+    # podman commands.
     - name: Log in to registry.redhat.io for the Lightspeed images
       containers.podman.podman_login:
         registry: registry.redhat.io
@@ -346,16 +346,23 @@
         password: "{{ registry_password }}"
         authfile: "{{ item }}"
       loop:
+        - /etc/foreman/registry-auth.json
         - /root/.config/containers/auth.json
-        - /run/containers/0/auth.json
       no_log: true
+
+    - name: Keep the registry login readable by root only
+      ansible.builtin.file:
+        path: /etc/foreman/registry-auth.json
+        owner: root
+        group: root
+        mode: "0600"
 
     # Fails in seconds with a clear message instead of 20+ installer errors.
     - name: Check that the registry login can pull a Lightspeed image
       ansible.builtin.command: >-
         podman pull --quiet registry.redhat.io/satellite/iop-gateway-rhel9:{{ satellite_version }}
       environment:
-        REGISTRY_AUTH_FILE: /root/.config/containers/auth.json
+        REGISTRY_AUTH_FILE: /etc/foreman/registry-auth.json
       changed_when: false
       register: iop_pull
       failed_when: false
