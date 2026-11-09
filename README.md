@@ -13,6 +13,9 @@ group_vars/all.yml                    variables of the vulnerable-nginx release 
 host_vars/localhost.yml               Python interpreter of the execution environment, for localhost only
 charts/vulnerable-nginx/              chart of that release, extracted from the cluster
 provision-vm.yml                      create a RHEL VM on OpenShift Virtualization, register it with console.redhat.com
+provision-satellite-vm.yml            same VM, registered to the demo Satellite (local Lightspeed) instead
+satellite-demo.yml                    Satellite VM (provision-satellite.yml) + one client VM (register-to-satellite.yml)
+aap/credential-type-satellite.yml     custom AAP credential type for Satellite (admin password, registry login, manifest)
 aap/credential-type-activation-key.yml  custom AAP credential type for the RHSM activation key
 resolve-vulnerable-item.yml           set a ServiceNow vulnerable item to Resolved
 resolve-remediation-task.yml          resolve the remediation task ServiceNow sent (imported by cve-remediation.yaml)

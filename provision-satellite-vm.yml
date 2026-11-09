@@ -1,0 +1,157 @@
+---
+# Provision a RHEL VM on OpenShift Virtualization and register it to the
+# Satellite from provision-satellite.yml (local Lightspeed) instead of
+# console.redhat.com. Same VM settings as provision-vm.yml.
+#
+# Job template requirements:
+#   - Credential: "OpenShift or Kubernetes API Bearer Token" (aap-vm-provisioner)
+#     -> creates the VM and looks up the Satellite Service IP
+#   - Credential: Machine (user cloud-user, private key, become sudo)
+#   - Credential: custom "Red Hat Satellite" (aap/credential-type-satellite.yml)
+#     -> satellite_admin_password
+#   - Credential: custom "ServiceNow", for the CMDB CI created at the end
+#     (register-cmdb-ci.yml); set snow_cmdb_register: false to skip it
+#   - Extra var or survey: vm_name, vm_ssh_public_key, satellite_fqdn
+# The Satellite activation key (demo-rhel9) only has RHEL 9 content, so this
+# playbook only builds RHEL 9 VMs unless satellite_activation_key points at a
+# key with other content.
+# The job pod SSHes to the VM's pod network IP, so it must run in the same
+# cluster (container group) and no NetworkPolicy may block port 22.
+
+- name: Create the VM on OpenShift Virtualization
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    vm_namespace: rhel-vms                  # must match openshift/vm-rbac.yml
+    vm_instancetype: u1.medium
+    vm_os: rhel9
+    vm_os_datasource: "{{ vm_os }}"         # DataSource in openshift-virtualization-os-images
+    vm_preference: "{{ vm_os | replace('rhel', 'rhel.') }}"
+    vm_os_datasource_namespace: openshift-virtualization-os-images
+    vm_disk_size: 30Gi
+    vm_storage_class: ""                    # empty = cluster default
+    vm_user: cloud-user
+
+  tasks:
+    - name: Check required variables
+      ansible.builtin.assert:
+        that:
+          - vm_name is defined and vm_name | length > 0
+          - vm_name is match('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+          - vm_name != 'satellite'
+          - vm_ssh_public_key is defined and vm_ssh_public_key | length > 0
+          - satellite_fqdn is defined and satellite_fqdn | length > 0
+          - vm_os == 'rhel9' or satellite_activation_key is defined
+        fail_msg: >-
+          Set vm_name (DNS-1123, lowercase, not "satellite"), vm_ssh_public_key and
+          satellite_fqdn. vm_os other than rhel9 needs satellite_activation_key with
+          matching content.
+
+    - name: Create or update the VirtualMachine
+      kubevirt.core.kubevirt_vm:
+        state: present
+        name: "{{ vm_name }}"
+        namespace: "{{ vm_namespace }}"
+        labels:
+          app: "{{ vm_name }}"
+          provisioned-by: aap
+          registered-to: satellite
+        instancetype:
+          name: "{{ vm_instancetype }}"
+        preference:
+          name: "{{ vm_preference }}"
+        data_volume_templates:
+          - metadata:
+              name: "{{ vm_name }}-rootdisk"
+            spec:
+              sourceRef:
+                kind: DataSource
+                name: "{{ vm_os_datasource }}"
+                namespace: "{{ vm_os_datasource_namespace }}"
+              storage: >-
+                {{ {'resources': {'requests': {'storage': vm_disk_size}}}
+                   | combine({'storageClassName': vm_storage_class} if vm_storage_class | length > 0 else {}) }}
+        spec:
+          domain:
+            devices: {}
+          volumes:
+            - name: rootdisk
+              dataVolume:
+                name: "{{ vm_name }}-rootdisk"
+            - name: cloudinitdisk
+              cloudInitNoCloud:
+                userData: |-
+                  #cloud-config
+                  hostname: {{ vm_name }}
+                  fqdn: {{ vm_name }}
+                  user: {{ vm_user }}
+                  ssh_pwauth: false
+                  disable_root: true
+                  ssh_authorized_keys:
+                    - {{ vm_ssh_public_key }}
+                  runcmd:
+                    - systemctl enable --now qemu-guest-agent
+        wait: true
+        wait_timeout: 900
+
+    - name: Wait for the VM to report an IP address (needs qemu-guest-agent)
+      kubernetes.core.k8s_info:
+        api_version: kubevirt.io/v1
+        kind: VirtualMachineInstance
+        name: "{{ vm_name }}"
+        namespace: "{{ vm_namespace }}"
+      register: vmi
+      until: >-
+        vmi.resources | length > 0
+        and (vmi.resources[0].status.interfaces | default([]) | selectattr('ipAddress', 'defined') | list | length > 0)
+      retries: 60
+      delay: 10
+
+    - name: Add the new VM to the in-memory inventory
+      ansible.builtin.add_host:
+        name: "{{ vm_name }}"
+        groups: new_vms
+        ansible_host: "{{ (vmi.resources[0].status.interfaces | selectattr('ipAddress', 'defined') | first).ipAddress }}"
+        ansible_user: "{{ vm_user }}"
+        vm_namespace: "{{ vm_namespace }}"
+
+- name: Wait for the VM to finish booting
+  hosts: new_vms
+  gather_facts: false
+  become: true
+
+  tasks:
+    - name: Wait until SSH is available
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+        delay: 10
+
+    - name: Wait for cloud-init to finish
+      ansible.builtin.command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+# Pins the Satellite FQDN to its Service IP, registers with the demo-rhel9
+# activation key and uploads the first report to local Lightspeed.
+- name: Register the VM to Satellite
+  ansible.builtin.import_playbook: register-to-satellite.yml
+
+- name: Refresh AAP inventories so the new VM can be targeted (optional)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  # Set aap_inventory_name, aap_inventory_source_ids and attach a
+  # "Red Hat Ansible Automation Platform" credential to enable this play.
+  tasks:
+    - name: Sync inventory sources
+      ansible.controller.inventory_source_update:
+        name: "{{ item }}"
+        inventory: "{{ aap_inventory_name }}"
+        wait: true
+      loop: "{{ aap_inventory_source_ids | default([]) }}"
+
+- name: Register the new VM in the ServiceNow CMDB
+  ansible.builtin.import_playbook: register-cmdb-ci.yml
