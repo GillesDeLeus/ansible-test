@@ -56,23 +56,49 @@
         regexp: '\s{{ satellite_fqdn | regex_escape }}(\s|$)'
         line: "{{ hostvars['localhost'].satellite_service_ip }} {{ satellite_fqdn }}"
 
-    - name: Generate the global registration command
-      redhat.satellite.registration_command:
-        server_url: "{{ sat_api }}"
-        username: admin
+    # redhat.satellite 3.15 (ee-supported) has no registration_command module,
+    # so call the same API endpoint directly.
+    - name: Look up the organization ID
+      ansible.builtin.uri:
+        url: "{{ sat_api }}/api/organizations?search={{ ('name=\"' ~ satellite_org ~ '\"') | urlencode }}"
+        user: admin
         password: "{{ satellite_admin_password }}"
+        force_basic_auth: true
         validate_certs: false
-        organization: "{{ satellite_org }}"
-        activation_keys: ["{{ satellite_ak }}"]
-        insecure: true              # fetch the Katello CA without verifying it first
-        setup_insights: true
-        setup_remote_execution: true
-        force: true                 # re-register hosts currently registered to the CDN
       delegate_to: localhost
       become: false
       run_once: true
-      no_log: true                  # the command embeds a JWT
-      register: reg
+      register: sat_orgs
+      failed_when: sat_orgs.json.results | default([]) | length != 1
+
+    - name: Generate the global registration command
+      ansible.builtin.uri:
+        url: "{{ sat_api }}/api/registration_commands"
+        method: POST
+        user: admin
+        password: "{{ satellite_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+        body_format: json
+        body:
+          registration_command:
+            organization_id: "{{ sat_orgs.json.results[0].id }}"
+            activation_keys: ["{{ satellite_ak }}"]
+            insecure: true              # fetch the Katello CA without verifying it first
+            setup_insights: true
+            setup_remote_execution: true
+            force: true                 # re-register hosts currently registered elsewhere
+      delegate_to: localhost
+      become: false
+      run_once: true
+      no_log: true                      # the command embeds a JWT
+      register: reg_api
+
+    - name: Keep only the command
+      ansible.builtin.set_fact:
+        reg:
+          registration_command: "{{ reg_api.json.registration_command }}"
+      no_log: true
 
     - name: Check whether this host is already registered to this Satellite
       ansible.builtin.shell: set -o pipefail && subscription-manager config --list | grep -E '^\s*hostname = '
