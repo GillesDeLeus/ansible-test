@@ -407,6 +407,7 @@
 
   vars:
     sat_api: "{{ satellite_api_url | default('https://' ~ satellite_fqdn) }}"
+    sat_org: "{{ satellite_organization | default('Devoteam Demo') }}"
 
   # redhat.satellite caches the API description under $XDG_CACHE_HOME/apypie;
   # the default ~/.cache in the EE is root-owned and the job runs as uid 1000.
@@ -419,7 +420,7 @@
       username: admin
       password: "{{ satellite_admin_password }}"
       validate_certs: false          # Katello self-signed CA; import it in AAP to switch this on
-      organization: "{{ satellite_organization | default('Devoteam Demo') }}"
+      # No organization here: global modules such as setting reject it.
 
   tasks:
     - name: Wait for the Satellite API
@@ -447,6 +448,7 @@
     - name: Upload the subscription manifest
       redhat.satellite.subscription_manifest:
         manifest_path: "{{ '/tmp/satellite-manifest.zip' if satellite_manifest_b64 is defined else satellite_manifest_path }}"
+        organization: "{{ sat_org }}"
         state: present
 
     # Content is only downloaded when a client asks for it.
@@ -458,6 +460,7 @@
     # RHEL 9 repo sets have a $releasever substitution; "9" = latest minor.
     - name: Enable RHEL 9 BaseOS and AppStream
       redhat.satellite.repository_set:
+        organization: "{{ sat_org }}"
         product: Red Hat Enterprise Linux for x86_64
         name: "{{ item }}"
         repositories:
@@ -470,10 +473,12 @@
 
     - name: Sync the RHEL product (metadata only with on_demand)
       redhat.satellite.repository_sync:
+        organization: "{{ sat_org }}"
         product: Red Hat Enterprise Linux for x86_64
 
     - name: Create the activation key for demo VMs
       redhat.satellite.activation_key:
+        organization: "{{ sat_org }}"
         name: "{{ satellite_activation_key | default('demo-rhel9') }}"
         lifecycle_environment: Library
         content_view: Default Organization View
