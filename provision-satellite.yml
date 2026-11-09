@@ -38,7 +38,10 @@
   vars:
     vm_name: satellite
     vm_namespace: rhel-vms
-    vm_instancetype: u1.2xlarge          # 8 vCPU / 32 GiB: Satellite + local Lightspeed
+    # Own namespaced instancetype so the size can match the nodes you have.
+    # 8 / 32Gi is comfortable; 4 / 24Gi fits an E4s_v5 node (Satellite min is 4 / 20 GB).
+    vm_cpus: 8
+    vm_memory: 32Gi
     vm_preference: rhel.9                # Satellite 6.19 runs on RHEL 9
     vm_os_datasource: rhel9
     vm_os_datasource_namespace: openshift-virtualization-os-images
@@ -61,6 +64,21 @@
           registry_username/registry_password and a manifest
           (satellite_manifest_b64 or satellite_manifest_path).
 
+    - name: Define the Satellite instancetype ({{ vm_cpus }} vCPU / {{ vm_memory }})
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: instancetype.kubevirt.io/v1beta1
+          kind: VirtualMachineInstancetype
+          metadata:
+            name: "{{ vm_name }}"
+            namespace: "{{ vm_namespace }}"
+          spec:
+            cpu:
+              guest: "{{ vm_cpus | int }}"
+            memory:
+              guest: "{{ vm_memory }}"
+
     - name: Build the storage spec once
       ansible.builtin.set_fact:
         sc_override: "{{ {'storageClassName': vm_storage_class} if vm_storage_class | length > 0 else {} }}"
@@ -74,7 +92,8 @@
           app: "{{ vm_name }}"
           provisioned-by: aap
         instancetype:
-          name: "{{ vm_instancetype }}"
+          kind: VirtualMachineInstancetype
+          name: "{{ vm_name }}"
         preference:
           name: "{{ vm_preference }}"
         data_volume_templates:
