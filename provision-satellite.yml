@@ -67,17 +67,14 @@
     - name: Define the Satellite instancetype ({{ vm_cpus }} vCPU / {{ vm_memory }})
       kubernetes.core.k8s:
         state: present
-        definition:
-          apiVersion: instancetype.kubevirt.io/v1beta1
-          kind: VirtualMachineInstancetype
-          metadata:
-            name: "{{ vm_name }}"
-            namespace: "{{ vm_namespace }}"
-          spec:
-            cpu:
-              guest: "{{ vm_cpus | int }}"
-            memory:
-              guest: "{{ vm_memory }}"
+        # One expression so cpu.guest stays an integer (a templated scalar
+        # inside a YAML mapping reaches the API as the string "4").
+        definition: >-
+          {{ {'apiVersion': 'instancetype.kubevirt.io/v1beta1',
+              'kind': 'VirtualMachineInstancetype',
+              'metadata': {'name': vm_name, 'namespace': vm_namespace},
+              'spec': {'cpu': {'guest': vm_cpus | int},
+                       'memory': {'guest': vm_memory | string}}} }}
 
     - name: Build the storage spec once
       ansible.builtin.set_fact:
