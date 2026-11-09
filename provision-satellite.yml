@@ -308,7 +308,9 @@
       when: ansible_facts.services['firewalld.service'].state | default('') == 'running'
 
     - name: Check that this installer knows --enable-iop
-      ansible.builtin.shell: set -o pipefail && satellite-installer --full-help | grep -q -- '--\[no-\]enable-iop'
+      # --help needs a scenario. No grep -q: it exits early and pipefail then
+      # reports the installer's broken pipe as a failure.
+      ansible.builtin.shell: set -o pipefail && satellite-installer --scenario satellite --full-help | grep -- '--\[no-\]enable-iop'
       changed_when: false
 
     - name: Run satellite-installer (base install)
@@ -342,7 +344,7 @@
       no_log: true
 
     - name: Enable Red Hat Lightspeed in Satellite (local advisor + vulnerability)
-      ansible.builtin.command: satellite-installer --enable-iop
+      ansible.builtin.command: satellite-installer --scenario satellite --enable-iop
       args:
         creates: /root/.satellite-iop-enabled
       async: 3600
