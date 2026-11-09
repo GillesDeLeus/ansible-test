@@ -408,6 +408,11 @@
   vars:
     sat_api: "{{ satellite_api_url | default('https://' ~ satellite_fqdn) }}"
 
+  # redhat.satellite caches the API description under $XDG_CACHE_HOME/apypie;
+  # the default ~/.cache in the EE is root-owned and the job runs as uid 1000.
+  environment:
+    XDG_CACHE_HOME: /tmp/.cache
+
   module_defaults:
     group/redhat.satellite.satellite:
       server_url: "{{ sat_api }}"
