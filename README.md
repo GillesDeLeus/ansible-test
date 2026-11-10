@@ -13,14 +13,21 @@ group_vars/all.yml                    variables of the vulnerable-nginx release 
 host_vars/localhost.yml               Python interpreter of the execution environment, for localhost only
 charts/vulnerable-nginx/              chart of that release, extracted from the cluster
 provision-vm.yml                      create a RHEL VM on OpenShift Virtualization, register it with console.redhat.com
-provision-satellite-vm.yml            same VM, registered to the demo Satellite (local Lightspeed) instead
-satellite-demo.yml                    Satellite VM (provision-satellite.yml) + one client VM (register-to-satellite.yml)
+cve-remediation.yaml                  console.redhat.com flow: ServiceNow-triggered remediation (lightspeed-remediation.yaml), then resolve the task
+lightspeed-remediation.yaml           console.redhat.com flow: remediation playbook downloaded from console.redhat.com
 aap/credential-type-satellite.yml     custom AAP credential type for Satellite (admin password, registry login, manifest)
+--- Satellite + local Red Hat Lightspeed (see "Satellite demo" below) ---
+provision-satellite.yml               Satellite 6.19 VM with local Lightspeed (IOP), manifest, RHEL 9 content, activation key
+register-to-satellite.yml             register VMs to that Satellite instead of console.redhat.com
+satellite-demo.yml                    provision-satellite.yml + one client VM + register-to-satellite.yml
+provision-satellite-vm.yml            new RHEL 9 VM registered to the Satellite, plus its CMDB CI
+patch-from-satellite.yml              apply the errata Satellite lists for a host, verify with Satellite, upload Insights
+sync-satellite-cves.yml               Satellite CVEs -> ServiceNow vulnerable items (create, link, resolve); scheduled
+cve-remediation-satellite.yaml        optional Satellite path: ServiceNow remediation task -> patch-from-satellite.yml -> resolve the task
 aap/credential-type-activation-key.yml  custom AAP credential type for the RHSM activation key
-resolve-vulnerable-item.yml           set a ServiceNow vulnerable item to Resolved
-resolve-remediation-task.yml          resolve the remediation task ServiceNow sent (imported by cve-remediation.yaml)
-resolve-vulnerable-items.yml          resolve vulnerable items one by one
-register-cmdb-ci.yml                  create/update the VM's CI through createCI (run at the end of provision-vm.yml)
+resolve-remediation-task.yml          resolve the remediation task ServiceNow sent (imported by cve-remediation*.yaml)
+resolve-vulnerable-items.yml          manual fallback: resolve vulnerable items one by one (imported by nothing)
+register-cmdb-ci.yml                  create/update the VM's CI through createCI or the Table API (run at the end of provision-*vm.yml)
 sync-insights-cves.yml                ServiceNow vulnerable item per Insights CVE of the VM (run after register-cmdb-ci.yml)
 tasks/redhat-api-token.yml            console.redhat.com token for the service account
 aap/credential-type-redhat-service-account.yml  custom AAP credential type for the Red Hat service account
@@ -32,7 +39,8 @@ roles/nginx_patch/
   tasks/upgrade.yml                   helm upgrade (atomic, waits for the rollout)
   tasks/verify.yml                    assert the running pods use the patched tag
 openshift/rbac.yml                    service account + RoleBinding in the nginx namespace
-openshift/ee-build.yml                in-cluster build of the execution environment (adds helm, kubevirt.core)
+openshift/ee-build.yml                in-cluster build of the execution environment (adds helm, kubevirt.core,
+                                      community.general <12, containers.podman); oc apply does not rebuild: oc start-build
 execution-environment/                ansible-builder definition (helm + all collections, requirements.yml)
 ```
 
@@ -130,30 +138,34 @@ One-time setup:
 | `vm_disk_size` / `vm_storage_class` | `30Gi` / cluster default | Root disk |
 | `aap_inventory_name`, `aap_inventory_source_ids` | unset | Inventory sources to sync afterwards (needs an AAP credential) |
 
-## Resolving a ServiceNow vulnerable item (`resolve-vulnerable-item.yml`)
-
-Sets the `sn_vul_vulnerable_item` record with sys_id `vulnerability_sys_id` to
-`Resolved` through the Table API, adds a work note, then reads the record back
-and fails if ServiceNow kept the old state (business rule or ACL). An item that
-is already Resolved is left alone.
+## ServiceNow access (all ServiceNow playbooks)
 
 1. In ServiceNow: a REST API key for an integration user that can write
-   vulnerable items (e.g. `sn_vul.remediation_owner`), and an API Access
-   Policy with the API Key authentication profile covering the Table API.
+   vulnerable items and remediation tasks (e.g. `sn_vul.remediation_owner`),
+   and an API Access Policy with the API Key authentication profile covering
+   the Table API (each playbook section lists the resources it needs).
 2. Credential type from `aap/credential-type-servicenow.yml`, plus one
-   credential of that type (instance URL, API key).
-3. Job template for `resolve-vulnerable-item.yml` with that credential and the
-   inventory with `localhost`, and a required survey question
-   `vulnerability_sys_id` (text, 32 characters). Callers that launch through
-   the API pass it as `extra_vars`; the survey is what lets them.
+   credential of that type (instance URL, API key). The playbooks read it as
+   `SN_HOST` / `SN_API_KEY`.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `vulnerability_sys_id` | required | sys_id of the vulnerable item (32 hex characters) |
-| `snow_vi_resolved_state` | `Resolved` | State label to set (label, not number) |
-| `snow_vi_work_note` | AAP job reference | Work note added with the change |
+## Remediation paths
+
+Both flows stay available; ServiceNow decides which job it launches.
+
+| Path | ServiceNow launches | Playbooks | Who resolves items and task |
+| --- | --- | --- | --- |
+| console.redhat.com (Insights) | job template for `cve-remediation.yaml` with `remtask_sys_id`, `vulnerable_item_sys_id` | `lightspeed-remediation.yaml`, then `resolve-remediation-task.yml` | the job resolves the task; ServiceNow resolves its items |
+| Satellite (default) | workflow "Patch VM + sync ServiceNow" with `target_hosts` = change CI | `patch-from-satellite.yml`, then `sync-satellite-cves.yml` | the sync resolves the items; Vulnerability Response closes the task |
+| Satellite (optional) | job template for `cve-remediation-satellite.yaml` with `remtask_sys_id`, `vulnerable_item_sys_id` | `patch-from-satellite.yml` for those CVEs and hosts, then `resolve-remediation-task.yml` | the job resolves the task |
+
+`resolve-vulnerable-items.yml` is not part of any path: run it by hand when
+resolving a task through the API does not resolve its items.
 
 ## Resolving a remediation task (`resolve-remediation-task.yml`)
+
+Used by the console.redhat.com path (`cve-remediation.yaml`) and the optional
+Satellite path (`cve-remediation-satellite.yaml`); the default Satellite
+workflow does not need it.
 
 ServiceNow launches the remediation job template (`cve-remediation.yaml`) when
 a remediation task is approved, with the task as `remtask_sys_id` and its
@@ -204,6 +216,8 @@ vulnerable_item_sys_id: ae292f5d47bb8b105f8e370cd36d4365,66292f5d47bb8b105f8e370
 | `snow_vi_verify_retries` / `snow_vi_verify_delay` | `12` / `10` | How long to wait for ServiceNow to resolve the items |
 
 ## Resolving vulnerable items one by one (`resolve-vulnerable-items.yml`)
+
+Manual fallback, imported by no other playbook.
 
 Sets the vulnerable items sent to `Resolved` with a work note, one Table API
 PATCH per item, and leaves the remediation task alone. It reads the items in
@@ -299,3 +313,90 @@ Setup:
 | `snow_create_missing_cves` | `true` | Create minimal `sn_vul_nvd_entry` records for CVEs ServiceNow does not know (needs create access) |
 | `insights_inventory_wait_retries` / `insights_evaluation_wait_retries` | `15` / `30` | Waits, 20 s per retry |
 | `cve_sync_target` | `new_vms` | Host or group when run on its own |
+
+## Satellite demo (Satellite + local Red Hat Lightspeed + ServiceNow)
+
+Same story as the console.redhat.com flow, but CVE data comes from a Red Hat
+Satellite 6.19 with local Red Hat Lightspeed (IOP) running as a VM on
+OpenShift Virtualization. A patch is confirmed by Satellite within seconds
+instead of waiting for the cloud analysis.
+
+```
+Satellite (errata/CVEs per host)
+   |  sync-satellite-cves.yml        AAP schedule (15 min) and after every patch
+   v
+ServiceNow: vulnerable items -> remediation task (VR rule groups by CI + assignment group)
+   |  approval flow -> change -> flow action launches the AAP workflow (target_hosts = change CI)
+   v
+AAP workflow: patch-from-satellite.yml --on success--> sync-satellite-cves.yml
+   (patched CVEs disappear from Satellite -> items Resolved -> task closes)
+```
+
+### One-time setup
+
+1. OpenShift: `oc apply -f openshift/vm-rbac.yml`. The Satellite VM needs
+   about 24-32 GiB RAM; the workers (D4s_v5, 16 GiB) cannot host it, so a
+   separate memory-optimised node is used (MachineSet
+   `aap-snow-46qm2-virt-westeurope1`, E4s_v5, `vm_cpus: 4`, `vm_memory: 24Gi`
+   to fit the Azure core quota). Scale it to 0 after deleting the VMs.
+2. Red Hat: a manifest (console.redhat.com > Subscriptions > Manifests) with a
+   subscription that includes RHEL, re-exported after adding it; a
+   registry.redhat.io service account (terms-based registry).
+3. AAP: credential types `aap/credential-type-satellite.yml` (+ the existing
+   activation key, ServiceNow and OpenShift ones). The manifest goes base64
+   encoded into the Satellite credential.
+4. Execution environment: `oc apply -f openshift/ee-build.yml` then
+   `oc start-build ee-nginx-patch -n aap --follow` (apply alone does not
+   rebuild). Set the EE's pull policy to Always.
+
+### Job templates
+
+| Template | Playbook | Credentials | Extra vars |
+| --- | --- | --- | --- |
+| Satellite demo - provision | `satellite-demo.yml` | OpenShift token, Machine, Activation Key, Satellite | `satellite_fqdn`, `vm_ssh_public_key`, `vm_cpus`/`vm_memory` |
+| Provision Satellite VM | `provision-satellite-vm.yml` | OpenShift token, Machine, Satellite, ServiceNow | `satellite_fqdn`, `snow_cmdb_endpoint: ""`, `snow_cmdb_relations`, `snow_vul_ci_services` (below) |
+| Satellite - patch VM | `patch-from-satellite.yml` | Machine, Satellite | `satellite_fqdn`; `target_hosts` prompted |
+| Satellite -> ServiceNow CVE sync | `sync-satellite-cves.yml` | Satellite, ServiceNow (no Machine; inventory with localhost only) | `satellite_fqdn`; schedule every 15 min, concurrent jobs off |
+| Patch VM + sync ServiceNow (workflow) | patch node, then sync node on success | per node | prompt on launch (`target_hosts`) |
+| (optional) Satellite remediation | `cve-remediation-satellite.yaml` | Machine, Satellite, ServiceNow | prompt on launch (`remtask_sys_id`, `vulnerable_item_sys_id`) |
+
+CMDB for Satellite VMs uses the Table API, not the createCI Scripted REST API
+(which attaches a fixed list of ~500 CVEs to every new CI):
+
+```yaml
+snow_cmdb_endpoint: ""
+snow_cmdb_relations:
+  - parent: c69d3c5be8094b50dd26f07907a9fb6c   # Salary System
+    type: 1a9cb166f1571100a92eb60da2bce5c5     # Depends on::Used by
+snow_vul_ci_services: [c69d3c5be8094b50dd26f07907a9fb6c]
+```
+
+### What sync-satellite-cves.yml does
+
+Agentless (Satellite and ServiceNow APIs only), for every host registered to
+Satellite except the Satellite itself:
+
+- CVEs from the applicable security errata; CI matched by the SMBIOS serial
+  Satellite reports (fallback: CI name).
+- Creates missing vulnerable items with `assignment_group` (UNIX) and
+  `has_impacted_services` (`snow_vi_fields`), like the createCI API did.
+- The vulnerability reference is dropped by ServiceNow on insert (field write
+  ACL with condition "Vulnerability is empty"), so the playbook creates one
+  item, reads it back, and sets the link in a second call when needed. If
+  neither works it deletes the test item and stops, instead of creating
+  hundreds of unlinked items. The second call also triggers the VR rule that
+  groups items into a remediation task.
+- Resolves open items whose CVE Satellite no longer reports, and items that
+  are linked to no vulnerability at all (`snow_close_fixed_items`,
+  `snow_close_orphaned_items`).
+
+### Limitations
+
+- Remote execution from Satellite to the VMs does not work (masquerade
+  networking: every VM reports 10.0.2.2). Patching goes through AAP.
+- Local Lightspeed only sees hosts registered to this Satellite; those hosts
+  are not on console.redhat.com, so `sync-insights-cves.yml` and the
+  console.redhat.com remediation playbook do not apply to them.
+- Update the Satellite itself only with `satellite-maintain`;
+  `patch-from-satellite.yml` always skips it.
+
