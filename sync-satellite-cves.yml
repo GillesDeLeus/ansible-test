@@ -12,6 +12,8 @@
 #   ServiceNow     -> CMDB CI by serial (by name when Satellite has no serial)
 #                  -> vulnerability record per CVE (created when missing)
 #                  -> vulnerable items that do not exist yet for that CI
+#                  -> open vulnerable items whose CVE Satellite no longer
+#                     reports for the host are set to Resolved (patched)
 # Satellite only lists CVEs an erratum fixes (fix available); Insights also
 # lists CVEs without a fix.
 #
@@ -24,6 +26,7 @@
 #   satellite_cve_host_search   Satellite host search to limit the hosts,
 #                               e.g. 'name = rhel-sat-1' (default: all hosts)
 #   satellite_cve_errata_types  default [security]
+#   snow_close_fixed_items      default true; false only creates items
 #   satellite_cves_sync: false  skip
 
 - name: Find the hosts registered to Satellite
@@ -105,6 +108,12 @@
     # false skips and lists them instead. Needs create access to sn_vul_nvd_entry.
     snow_create_missing_cves: true
     snow_query_batch: 50
+    # Close open items on the CI whose CVE Satellite no longer reports. This
+    # covers every open item on the CI, also ones not created by this sync.
+    snow_close_fixed_items: true
+    # Choice label, not number (sysparm_input_display_value=true), as in
+    # resolve-vulnerable-items.yml.
+    snow_vi_resolved_state: Resolved
 
   tasks:
     # --- Satellite ----------------------------------------------------------
@@ -140,9 +149,10 @@
         sat_cves: "{{ (sat_cve_details | default({})).keys() | list | sort }}"
         sat_cve_details: "{{ sat_cve_details | default({}) }}"
 
-    - name: Stop for hosts without CVEs
+    # Hosts without CVEs still continue: their open items may need closing.
+    - name: Stop for hosts without CVEs when nothing is closed
       ansible.builtin.meta: end_host
-      when: sat_cves | length == 0
+      when: sat_cves | length == 0 and not (snow_close_fixed_items | bool)
 
     # subscription-manager reports the SMBIOS serial as a fact; the CMDB CI
     # from register-cmdb-ci.yml is keyed on the same serial.
@@ -289,23 +299,82 @@
       failed_when: false
       no_log: true
 
+    # --- Close what Satellite no longer reports -----------------------------
+
+    - name: List the open vulnerable items of the CI
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_api }}/{{ snow_vi_table }}?sysparm_limit=10000&sysparm_fields=sys_id,number,vulnerability.id&sysparm_query={{
+          ('cmdb_ci=' ~ snow_ci.json.result[0].sys_id ~ '^active=true') | urlencode }}
+        headers: "{{ snow_headers }}"
+      register: snow_open_vis
+      when: snow_close_fixed_items | bool
+      failed_when: false
+      no_log: true
+
+    - name: Check the open vulnerable items were read
+      ansible.builtin.assert:
+        that: snow_open_vis.status == 200
+        fail_msg: "Reading open {{ snow_vi_table }} records failed: HTTP {{ snow_open_vis.status }}"
+        quiet: true
+      when: snow_close_fixed_items | bool
+
+    - name: Resolve the items Satellite no longer reports
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_api }}/{{ snow_vi_table }}/{{ item.sys_id }}?sysparm_input_display_value=true&sysparm_display_value=true&sysparm_fields=number,state
+        method: PATCH
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          state: "{{ snow_vi_resolved_state }}"
+          work_notes: >-
+            Red Hat Satellite no longer reports {{ item['vulnerability.id'] }} for
+            {{ inventory_hostname }}: the fixing erratum is installed
+            (AAP job {{ tower_job_id | default('n/a') }}).
+      register: snow_vi_closed
+      # "vulnerability.id" is one key (dot-walked field), so test it per item;
+      # selectattr would read the dot as a nested attribute.
+      loop: "{{ snow_open_vis.json.result | default([]) }}"
+      loop_control:
+        label: "{{ item.number }} {{ item['vulnerability.id'] }}"
+      when:
+        - snow_close_fixed_items | bool
+        - item['vulnerability.id'] | default('') | upper is match('^CVE-')
+        - item['vulnerability.id'] | upper not in sat_cves
+      changed_when: snow_vi_closed.status | default(0) == 200
+      failed_when: false
+      no_log: true
+
     - name: Report the result
       ansible.builtin.assert:
         that: vi_failed | length == 0
         fail_msg: >-
-          {{ vi_failed | length }} vulnerable item(s) could not be created
-          (HTTP {{ vi_failed | map(attribute='status') | unique | join(', ') }}):
-          {{ vi_failed | map(attribute='item') | join(', ') }}
+          {{ vi_failed | length }} vulnerable item(s) could not be created or resolved
+          (HTTP {{ vi_failed | map(attribute='status') | unique | join(', ') }}; a 200 on a
+          resolve means a business rule, ACL or missing role kept the old state):
+          {{ ((vi_failed | map(attribute='item') | select('string') | list)
+              + (vi_failed | map(attribute='item') | reject('string') | map(attribute='number') | list))
+             | join(', ') | truncate(500) }}
         success_msg: >-
           {{ inventory_hostname }}: {{ sat_cves | length }} CVEs with a fix in Satellite,
           {{ vi_created | length }} vulnerable items created,
+          {{ vi_closed | length }} resolved because Satellite no longer reports them{{
+          (' (' ~ vi_closed | map(attribute='item.number') | join(', ') ~ ')') if vi_closed else '' }},
           {{ snow_cve_ids | length - vi_created | length }} already existed,
           {{ cve_records_created | length }} {{ snow_cve_table }} records created,
           {{ cves_skipped | length }} skipped (no {{ snow_cve_table }} record){{
           (': ' ~ cves_skipped | join(', ')) if cves_skipped else '' }}.
       vars:
-        vi_failed: "{{ snow_vi_created.results | rejectattr('status', 'eq', 201) | list }}"
         vi_created: "{{ snow_vi_created.results | selectattr('status', 'eq', 201) | list }}"
+        # Resolved = API 200 and the stored state really is the resolved one.
+        vi_close_results: "{{ snow_vi_closed.results | default([]) | selectattr('status', 'defined') | list }}"
+        vi_closed: >-
+          {{ vi_close_results | selectattr('status', 'eq', 200)
+             | selectattr('json.result.state', 'eq', snow_vi_resolved_state) | list }}
+        vi_failed: >-
+          {{ snow_vi_created.results | rejectattr('status', 'eq', 201) | list
+             + vi_close_results | reject('in', vi_closed) | list }}
         cves_skipped: "{{ sat_cves | difference(snow_cve_ids.keys()) }}"
         cve_records_created: >-
           {{ snow_cve_created.results | default([]) | selectattr('status', 'defined')
