@@ -59,6 +59,12 @@
     #     type: 1a9cb166f1571100a92eb60da2bce5c5     # Depends on::Used by
     snow_cmdb_relations: []
     snow_rel_url: "{{ snow_host }}/api/now/table/cmdb_rel_ci"
+    # Vulnerability Response CI-to-service links (sn_vul_m2m_ci_services, used
+    # for the risk score), as the createCI Scripted REST API creates them for
+    # the Salary System. Service sys_ids; [] = none. Only needed with the Table
+    # API (snow_cmdb_endpoint: ""), e.g. [c69d3c5be8094b50dd26f07907a9fb6c].
+    snow_vul_ci_services: []
+    snow_vul_ci_services_url: "{{ snow_host }}/api/now/table/sn_vul_m2m_ci_services"
     # Reference fields (manufacturer -> core_company, model_id -> cmdb_model)
     # are sent by name and resolved by ServiceNow; a name with no matching or
     # readable record leaves the field empty. false leaves them out.
@@ -285,3 +291,52 @@
         rel_failed: "{{ cmdb_rel_create.results | rejectattr('status', 'eq', 201) | list }}"
         rel_created: "{{ cmdb_rel_create.results | selectattr('status', 'eq', 201) | list }}"
       when: snow_cmdb_relations | length > 0
+
+    - name: Look up the Vulnerability Response service links that already exist
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_vul_ci_services_url }}?sysparm_limit=1&sysparm_fields=sys_id&sysparm_query={{
+          ('item=' ~ cmdb_ci_sys_id ~ '^service=' ~ item) | urlencode }}
+        headers: "{{ snow_headers }}"
+      register: vul_svc_lookup
+      loop: "{{ snow_vul_ci_services }}"
+      delegate_to: localhost
+      become: false
+      failed_when: false
+      no_log: true
+
+    - name: Create the missing Vulnerability Response service links
+      ansible.builtin.uri:
+        url: "{{ snow_vul_ci_services_url }}?sysparm_fields=sys_id"
+        method: POST
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          item: "{{ cmdb_ci_sys_id }}"
+          service: "{{ item.item }}"
+      register: vul_svc_create
+      loop: >-
+        {{ vul_svc_lookup.results | default([]) | selectattr('status', 'defined')
+           | selectattr('status', 'eq', 200) | selectattr('json.result', 'equalto', []) | list }}
+      loop_control:
+        label: "{{ item.item }}"
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+    - name: Report the Vulnerability Response service links
+      ansible.builtin.assert:
+        that:
+          - vul_svc_lookup.results | rejectattr('status', 'eq', 200) | list | length == 0
+          - vul_svc_create.results | default([]) | rejectattr('status', 'eq', 201) | list | length == 0
+        fail_msg: >-
+          Reading or creating sn_vul_m2m_ci_services failed: HTTP
+          {{ (vul_svc_lookup.results + vul_svc_create.results | default([]))
+             | map(attribute='status') | reject('in', [200, 201]) | unique | join(', ') }}
+        success_msg: >-
+          Vulnerability Response service links of {{ inventory_hostname }}:
+          {{ vul_svc_create.results | default([]) | selectattr('status', 'eq', 201) | list | length }} created,
+          {{ snow_vul_ci_services | length - vul_svc_create.results | default([]) | length }} already existed.
+      when: snow_vul_ci_services | length > 0

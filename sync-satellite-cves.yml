@@ -115,6 +115,12 @@
     # all (empty or dangling link, e.g. a CVE record created by this sync that
     # ServiceNow later removed). They cannot be acted on.
     snow_close_orphaned_items: true
+    # Extra fields set on new vulnerable items, and filled in on open items
+    # that miss them, the same way the createCI Scripted REST API does it
+    # (VR remediation task rules may group on them). {} = none.
+    snow_vi_fields:
+      assignment_group: 3a358d2bdb8433005daef4eabf961956   # UNIX
+      has_impacted_services: true
     # Choice label, not number (sysparm_input_display_value=true), as in
     # resolve-vulnerable-items.yml.
     snow_vi_resolved_state: Resolved
@@ -299,13 +305,13 @@
         method: POST
         headers: "{{ snow_headers }}"
         body_format: json
-        body:
-          cmdb_ci: "{{ snow_ci.json.result[0].sys_id }}"
-          vulnerability: "{{ snow_cve_ids[vi_to_create[0]] }}"
-          work_notes: >-
-            Reported by Red Hat Satellite for {{ inventory_hostname }}:
-            fixed by {{ sat_cve_details[vi_to_create[0]].advisories | join(', ') }}
-            (severity {{ sat_cve_details[vi_to_create[0]].severity }}), available in Satellite.
+        body: >-
+          {{ {'cmdb_ci': snow_ci.json.result[0].sys_id,
+              'vulnerability': snow_cve_ids[vi_to_create[0]],
+              'work_notes': 'Reported by Red Hat Satellite for ' ~ inventory_hostname
+                            ~ ': fixed by ' ~ sat_cve_details[vi_to_create[0]].advisories | join(', ')
+                            ~ ' (severity ' ~ sat_cve_details[vi_to_create[0]].severity
+                            ~ '), available in Satellite.'} | combine(snow_vi_fields) }}
       register: snow_vi_probe
       when: vi_to_create | length > 0
       changed_when: snow_vi_probe.status | default(0) == 201
@@ -378,13 +384,13 @@
         method: POST
         headers: "{{ snow_headers }}"
         body_format: json
-        body:
-          cmdb_ci: "{{ snow_ci.json.result[0].sys_id }}"
-          vulnerability: "{{ snow_cve_ids[item] }}"
-          work_notes: >-
-            Reported by Red Hat Satellite for {{ inventory_hostname }}:
-            fixed by {{ sat_cve_details[item].advisories | join(', ') }}
-            (severity {{ sat_cve_details[item].severity }}), available in Satellite.
+        body: >-
+          {{ {'cmdb_ci': snow_ci.json.result[0].sys_id,
+              'vulnerability': snow_cve_ids[item],
+              'work_notes': 'Reported by Red Hat Satellite for ' ~ inventory_hostname
+                            ~ ': fixed by ' ~ sat_cve_details[item].advisories | join(', ')
+                            ~ ' (severity ' ~ sat_cve_details[item].severity
+                            ~ '), available in Satellite.'} | combine(snow_vi_fields) }}
       register: snow_vi_created
       # The first item was created (or failed) above.
       loop: "{{ vi_to_create[1:] if snow_vi_probe.status | default(0) == 201 else vi_to_create }}"
@@ -417,7 +423,7 @@
     - name: List the open vulnerable items of the CI
       ansible.builtin.uri:
         url: >-
-          {{ snow_api }}/{{ snow_vi_table }}?sysparm_limit=10000&sysparm_exclude_reference_link=true&sysparm_fields=sys_id,number,vulnerability,vulnerability.id,vulnerability.sys_class_name,opened_at,sys_created_by&sysparm_query={{
+          {{ snow_api }}/{{ snow_vi_table }}?sysparm_limit=10000&sysparm_exclude_reference_link=true&sysparm_fields=sys_id,number,vulnerability,vulnerability.id,vulnerability.sys_class_name,opened_at,sys_created_by,assignment_group&sysparm_query={{
           ('cmdb_ci=' ~ snow_ci.json.result[0].sys_id ~ '^active=true') | urlencode }}
         headers: "{{ snow_headers }}"
       register: snow_open_vis
@@ -463,6 +469,29 @@
           (vid is match('^CVE-') and vid not in sat_cves)
           or (orphaned | bool and snow_close_orphaned_items | bool)
       changed_when: snow_vi_closed.status | default(0) == 200
+      failed_when: false
+      no_log: true
+
+    # Items created before snow_vi_fields existed (or by an older sync) miss
+    # the assignment group; fill in the fields on the ones that stay open.
+    - name: Fill in the extra fields on open items that miss them
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_api }}/{{ snow_vi_table }}/{{ item.sys_id }}?sysparm_fields=sys_id,number
+        method: PATCH
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body: "{{ snow_vi_fields }}"
+      register: snow_vi_backfill
+      loop: "{{ snow_open_vis.json.result | default([]) }}"
+      loop_control:
+        label: "{{ item.number }}"
+      when:
+        - snow_close_fixed_items | bool
+        - snow_vi_fields.assignment_group is defined
+        - item.assignment_group | default('', true) == ''
+        - item['vulnerability.id'] | default('', true) | upper in sat_cves
+      changed_when: snow_vi_backfill.status | default(0) == 200
       failed_when: false
       no_log: true
 
