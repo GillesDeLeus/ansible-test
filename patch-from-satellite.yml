@@ -13,7 +13,10 @@
 #   - Credential: Machine (cloud-user + key, sudo)
 #   - Credential: custom "Red Hat Satellite" -> satellite_admin_password
 #   - Inventory containing the hosts; extra vars:
-#       target_hosts      host or group to patch (required)
+#       target_hosts      host, group or pattern to patch (required); "*" or
+#                         all = every inventory host registered to Satellite.
+#                         localhost and the Satellite VM are always excluded,
+#                         hosts Satellite does not know are skipped.
 #       satellite_fqdn    e.g. satellite.apps.<cluster-domain>
 #   Optional:
 #       patch_errata_types   default [security]; e.g. [security, bugfix, enhancement]
@@ -21,9 +24,12 @@
 #                            e.g. the CVEs of a ServiceNow remediation task
 #       patch_reboot         default true: reboot when needs-restarting says so
 #       satellite_api_url    default https://<satellite_fqdn>
+#       satellite_vm_name    inventory name of the Satellite VM (default satellite)
 
+# The Satellite itself must only be updated with satellite-maintain, never
+# with plain dnf, so it is excluded even when target_hosts is "*".
 - name: Patch hosts with the errata Satellite reports as applicable
-  hosts: "{{ target_hosts }}"
+  hosts: "{{ target_hosts }}:!localhost:!{{ satellite_vm_name | default('satellite') }}"
   gather_facts: false
   become: true
 
@@ -60,15 +66,33 @@
       ansible.builtin.command: subscription-manager identity
       register: rhsm_identity
       changed_when: false
-
-    - name: Fail when the host is not registered
-      ansible.builtin.assert:
-        that: rhsm_identity.stdout is search('^name:\s*\S+', multiline=True)
-        fail_msg: "{{ inventory_hostname }} is not registered (subscription-manager identity has no name)."
+      failed_when: false
 
     - name: Remember the Satellite host name
       ansible.builtin.set_fact:
-        sat_host_name: "{{ rhsm_identity.stdout | regex_search('^name:\\s*(\\S+)', '\\1', multiline=True) | first }}"
+        sat_host_name: "{{ rhsm_identity.stdout | default('') | regex_search('^name:\\s*(\\S+)', '\\1', multiline=True) | default([''], true) | first }}"
+
+    # Skipped hosts get no patch_advisories, so cve-remediation-satellite.yaml
+    # still treats them as not remediated.
+    - name: Skip hosts that are not registered
+      when: sat_host_name | length == 0
+      block:
+        - name: Not registered
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }}: not registered (no subscription-manager identity), skipped."
+
+        - name: Stop for this host
+          ansible.builtin.meta: end_host
+
+    - name: Skip the Satellite itself
+      when: sat_host_name == (satellite_fqdn | default(''))
+      block:
+        - name: Satellite host
+          ansible.builtin.debug:
+            msg: "{{ inventory_hostname }} is the Satellite: update it with satellite-maintain, skipped."
+
+        - name: Stop for this host
+          ansible.builtin.meta: end_host
 
     - name: Look up the host in Satellite
       ansible.builtin.uri:
@@ -77,7 +101,19 @@
       register: sat_host
       delegate_to: localhost
       become: false
-      failed_when: sat_host.status != 200 or sat_host.json.results | length != 1
+      failed_when: sat_host.status != 200
+
+    - name: Skip hosts this Satellite does not know
+      when: sat_host.json.results | length != 1
+      block:
+        - name: Not in Satellite
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: registered as {{ sat_host_name }}, but not to this
+              Satellite (e.g. console.redhat.com), skipped.
+
+        - name: Stop for this host
+          ansible.builtin.meta: end_host
 
     - name: Remember the Satellite host ID
       ansible.builtin.set_fact:

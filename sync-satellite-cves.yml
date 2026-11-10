@@ -304,7 +304,7 @@
     - name: List the open vulnerable items of the CI
       ansible.builtin.uri:
         url: >-
-          {{ snow_api }}/{{ snow_vi_table }}?sysparm_limit=10000&sysparm_fields=sys_id,number,vulnerability.id&sysparm_query={{
+          {{ snow_api }}/{{ snow_vi_table }}?sysparm_limit=10000&sysparm_fields=sys_id,number,vulnerability.id,vulnerability.sys_class_name,opened_at,sys_created_by&sysparm_query={{
           ('cmdb_ci=' ~ snow_ci.json.result[0].sys_id ~ '^active=true') | urlencode }}
         headers: "{{ snow_headers }}"
       register: snow_open_vis
@@ -345,6 +345,31 @@
       changed_when: snow_vi_closed.status | default(0) == 200
       failed_when: false
       no_log: true
+
+    # Open items whose vulnerability is not a CVE are left alone on purpose
+    # (created by something else, e.g. a scanner or advisory-based integration).
+    # Dot-walked fields are single keys ("vulnerability.id"), hence item[...].
+    - name: Open items left alone (vulnerability is not a CVE)
+      ansible.builtin.debug:
+        msg:
+          - "{{ not_cve | length }} open item(s) on the CI are not linked to a CVE and were not touched."
+          - "By vulnerability table: {{ not_cve | map(attribute='table') | community.general.counter }}"
+          - "By creator: {{ not_cve | map(attribute='creator') | community.general.counter }}"
+          - "Examples (number | vulnerability id | opened): {{ not_cve[:10] | map(attribute='line') | list }}"
+      vars:
+        not_cve: >-
+          {%- set out = [] -%}
+          {%- for i in snow_open_vis.json.result | default([]) -%}
+            {%- set vid = i['vulnerability.id'] | default('', true) -%}
+            {%- if not (vid | upper is match('^CVE-')) -%}
+              {%- set _ = out.append({
+                    'table': i['vulnerability.sys_class_name'] | default('', true) or '(none)',
+                    'creator': i['sys_created_by'] | default('', true) or '(unknown)',
+                    'line': i['number'] ~ ' | ' ~ (vid or '(empty)') ~ ' | ' ~ i['opened_at'] | default('') }) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+      when: snow_close_fixed_items | bool
 
     - name: Report the result
       ansible.builtin.assert:
