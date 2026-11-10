@@ -1,0 +1,173 @@
+---
+# Patch Satellite-registered hosts with the errata Satellite says apply to
+# them, verify the fix through Satellite's errata applicability, then upload
+# a fresh Insights report to local Red Hat Lightspeed.
+#
+#   1. Ask Satellite which errata (and their CVEs) apply to each host
+#   2. dnf upgrade --advisory=<those errata> on the host, reboot if needed
+#   3. Upload the new package profile, so Satellite recalculates applicability
+#   4. Wait until Satellite no longer lists the patched errata (seconds)
+#   5. insights-client: new report for Lightspeed (re-analysis is async)
+#
+# Job template requirements:
+#   - Credential: Machine (cloud-user + key, sudo)
+#   - Credential: custom "Red Hat Satellite" -> satellite_admin_password
+#   - Inventory containing the hosts; extra vars:
+#       target_hosts      host or group to patch (required)
+#       satellite_fqdn    e.g. satellite.apps.<cluster-domain>
+#   Optional:
+#       patch_errata_types   default [security]; e.g. [security, bugfix, enhancement]
+#       patch_cves           only errata fixing these CVEs (list or comma-separated),
+#                            e.g. the CVEs of a ServiceNow remediation task
+#       patch_reboot         default true: reboot when needs-restarting says so
+#       satellite_api_url    default https://<satellite_fqdn>
+
+- name: Patch hosts with the errata Satellite reports as applicable
+  hosts: "{{ target_hosts }}"
+  gather_facts: false
+  become: true
+
+  vars:
+    sat_api: "{{ satellite_api_url | default('https://' ~ satellite_fqdn) }}"
+    patch_types: "{{ patch_errata_types | default(['security']) }}"
+    patch_cve_list: >-
+      {{ (patch_cves.split(',') if patch_cves is string else patch_cves | default([]))
+         | map('trim') | map('upper') | reject('equalto', '') | list }}
+    # Katello scoped search on the host's errata
+    errata_search: >-
+      {{ '(' ~ (patch_types | map('regex_replace', '^(.*)$', 'type = \1') | join(' or ')) ~ ')'
+         ~ ((' and (' ~ (patch_cve_list | map('regex_replace', '^(.*)$', 'cve = \1') | join(' or ')) ~ ')')
+            if patch_cve_list | length > 0 else '') }}
+    sat_auth: &sat_auth
+      user: admin
+      password: "{{ satellite_admin_password }}"
+      force_basic_auth: true
+      validate_certs: false
+
+  tasks:
+    - name: Check required variables
+      ansible.builtin.assert:
+        that:
+          - satellite_fqdn is defined or satellite_api_url is defined
+          - satellite_admin_password is defined
+        fail_msg: "Set satellite_fqdn and attach the 'Red Hat Satellite' credential."
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    # Satellite names the host after the RHSM consumer name, so ask the host.
+    - name: Read the host's registration name
+      ansible.builtin.command: subscription-manager identity
+      register: rhsm_identity
+      changed_when: false
+
+    - name: Fail when the host is not registered
+      ansible.builtin.assert:
+        that: rhsm_identity.stdout is search('^name:\s*\S+', multiline=True)
+        fail_msg: "{{ inventory_hostname }} is not registered (subscription-manager identity has no name)."
+
+    - name: Remember the Satellite host name
+      ansible.builtin.set_fact:
+        sat_host_name: "{{ rhsm_identity.stdout | regex_search('^name:\\s*(\\S+)', '\\1', multiline=True) | first }}"
+
+    - name: Look up the host in Satellite
+      ansible.builtin.uri:
+        url: "{{ sat_api }}/api/hosts?search={{ ('name = \"' ~ sat_host_name ~ '\"') | urlencode }}"
+        <<: *sat_auth
+      register: sat_host
+      delegate_to: localhost
+      become: false
+      failed_when: sat_host.status != 200 or sat_host.json.results | length != 1
+
+    - name: Remember the Satellite host ID
+      ansible.builtin.set_fact:
+        sat_host_id: "{{ sat_host.json.results[0].id }}"
+
+    - name: Get the applicable errata from Satellite
+      ansible.builtin.uri:
+        url: "{{ sat_api }}/api/hosts/{{ sat_host_id }}/errata?per_page=1000&search={{ errata_search | urlencode }}"
+        <<: *sat_auth
+      register: sat_errata
+      delegate_to: localhost
+      become: false
+
+    - name: Collect advisories and CVEs
+      ansible.builtin.set_fact:
+        patch_advisories: "{{ sat_errata.json.results | map(attribute='errata_id') | list | unique | sort }}"
+        patch_fixed_cves: >-
+          {{ sat_errata.json.results | map(attribute='cves') | flatten
+             | map(attribute='cve_id') | list | unique | sort }}
+
+    - name: Show what will be patched
+      ansible.builtin.debug:
+        msg:
+          - "Host {{ sat_host_name }} (Satellite ID {{ sat_host_id }})"
+          - "Search: {{ errata_search }}"
+          - "{{ patch_advisories | length }} errata: {{ patch_advisories | join(', ') }}"
+          - "{{ patch_fixed_cves | length }} CVEs: {{ patch_fixed_cves | join(', ') }}"
+
+    - name: Nothing to patch on this host
+      ansible.builtin.meta: end_host
+      when: patch_advisories | length == 0
+
+    - name: Apply the errata
+      ansible.builtin.command:
+        argv: "{{ ['dnf', '-y', 'upgrade'] + (patch_advisories | map('regex_replace', '^', '--advisory=') | list) }}"
+      register: dnf_patch
+      changed_when: "'Nothing to do' not in dnf_patch.stdout"
+
+    - name: Check whether a reboot is needed
+      ansible.builtin.command: needs-restarting -r
+      register: needs_reboot
+      changed_when: false
+      failed_when: needs_reboot.rc not in [0, 1]
+
+    - name: Reboot
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+      when:
+        - needs_reboot.rc == 1
+        - patch_reboot | default(true) | bool
+
+    # The dnf plugin usually does this after each transaction; forcing it
+    # makes Satellite recalculate applicability now.
+    - name: Upload the new package profile to Satellite
+      ansible.builtin.command: dnf uploadprofile --force-upload
+      changed_when: true
+      failed_when: false
+
+    - name: Wait until Satellite no longer lists the patched errata
+      ansible.builtin.uri:
+        url: "{{ sat_api }}/api/hosts/{{ sat_host_id }}/errata?per_page=1000&search={{ errata_search | urlencode }}"
+        <<: *sat_auth
+      register: sat_errata_after
+      delegate_to: localhost
+      become: false
+      until: >-
+        sat_errata_after.json.results | map(attribute='errata_id')
+        | select('in', patch_advisories) | list | length == 0
+      retries: 18
+      delay: 10
+      failed_when: false
+
+    - name: Errata still applicable after patching
+      ansible.builtin.set_fact:
+        patch_remaining: >-
+          {{ sat_errata_after.json.results | default([]) | map(attribute='errata_id')
+             | select('in', patch_advisories) | list }}
+
+    - name: Upload a new Insights report to local Lightspeed
+      ansible.builtin.command: insights-client
+      changed_when: false
+
+    - name: Result
+      ansible.builtin.debug:
+        msg:
+          - "Applied {{ patch_advisories | length }} errata, fixing {{ patch_fixed_cves | length }} CVEs."
+          - "{{ 'Rebooted.' if (needs_reboot.rc == 1 and patch_reboot | default(true) | bool) else ('Reboot needed but skipped.' if needs_reboot.rc == 1 else 'No reboot needed.') }}"
+          - "{{ 'Satellite confirms all errata are installed.' if patch_remaining | length == 0 else 'Still applicable per Satellite: ' ~ patch_remaining | join(', ') }}"
+
+    - name: Fail when Satellite still lists patched errata
+      ansible.builtin.fail:
+        msg: "Satellite still lists {{ patch_remaining | join(', ') }} as applicable to {{ sat_host_name }} after patching."
+      when: patch_remaining | length > 0
