@@ -1,0 +1,311 @@
+---
+# Report the CVEs Red Hat Satellite knows about to ServiceNow: one vulnerable
+# item (sn_vul_vulnerable_item) per CVE per host, linked to the host's CMDB CI.
+# Meant to run on an AAP schedule (e.g. every 15 minutes), so Satellite
+# effectively reports to ServiceNow on its own.
+#
+# Agentless: everything comes from the Satellite API (no SSH to the VMs, no
+# AAP inventory of the VMs needed). Every host registered to Satellite is
+# covered, including new ones, except the Satellite itself.
+#   Satellite host -> applicable security errata and their CVEs
+#                  -> SMBIOS serial (reported by subscription-manager)
+#   ServiceNow     -> CMDB CI by serial (by name when Satellite has no serial)
+#                  -> vulnerability record per CVE (created when missing)
+#                  -> vulnerable items that do not exist yet for that CI
+# Satellite only lists CVEs an erratum fixes (fix available); Insights also
+# lists CVEs without a fix.
+#
+# Job template requirements:
+#   - Credential: custom "Red Hat Satellite" -> satellite_admin_password
+#   - Credential: custom "ServiceNow" (aap/credential-type-servicenow.yml)
+#   - Inventory with localhost (no Machine credential needed)
+#   - Extra var: satellite_fqdn (or satellite_api_url)
+# Optional:
+#   satellite_cve_host_search   Satellite host search to limit the hosts,
+#                               e.g. 'name = rhel-sat-1' (default: all hosts)
+#   satellite_cve_errata_types  default [security]
+#   satellite_cves_sync: false  skip
+
+- name: Find the hosts registered to Satellite
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    sat_api: "{{ satellite_api_url | default('https://' ~ (satellite_fqdn | default(''))) }}"
+    sat_org: "{{ satellite_organization | default('Devoteam Demo') }}"
+    host_search: >-
+      {{ (['organization = "' ~ sat_org ~ '"']
+          + ([satellite_cve_host_search] if satellite_cve_host_search | default('') | length > 0 else []))
+         | join(' and ') }}
+
+  tasks:
+    - name: Skip when the CVE sync is disabled
+      ansible.builtin.meta: end_playbook
+      when: not (satellite_cves_sync | default(true) | bool)
+
+    - name: Check the credentials
+      ansible.builtin.assert:
+        that:
+          - satellite_fqdn is defined or satellite_api_url is defined
+          - satellite_admin_password is defined
+          - lookup('ansible.builtin.env', 'SN_HOST') | length > 0
+          - lookup('ansible.builtin.env', 'SN_API_KEY') | length > 0
+        fail_msg: "Set satellite_fqdn and attach the Red Hat Satellite and ServiceNow credentials."
+        quiet: true
+
+    - name: List the hosts in Satellite
+      ansible.builtin.uri:
+        url: "{{ sat_api }}/api/hosts?per_page=1000&thin=true&search={{ host_search | urlencode }}"
+        user: admin
+        password: "{{ satellite_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: sat_hosts
+
+    # The Satellite registers itself as a host; it is infrastructure, not a
+    # demo VM.
+    - name: Add each host as a local (API-only) target
+      ansible.builtin.add_host:
+        name: "{{ item.name }}"
+        groups: satellite_cve_hosts
+        ansible_connection: local
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+        sat_host_id: "{{ item.id }}"
+      loop: "{{ sat_hosts.json.results | rejectattr('name', 'eq', satellite_fqdn | default('')) | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Hosts to report
+      ansible.builtin.debug:
+        msg: "{{ groups['satellite_cve_hosts'] | default([]) | length }} host(s): {{ groups['satellite_cve_hosts'] | default([]) | join(', ') }}"
+
+- name: Report each host's CVEs to ServiceNow
+  hosts: satellite_cve_hosts
+  gather_facts: false
+
+  vars:
+    sat_api: "{{ satellite_api_url | default('https://' ~ satellite_fqdn) }}"
+    satellite_cve_errata_types: [security]
+    sat_errata_search: >-
+      {{ satellite_cve_errata_types | map('regex_replace', '^(.*)$', 'type = \1') | join(' or ') }}
+
+    snow_host: "{{ lookup('ansible.builtin.env', 'SN_HOST') | trim | regex_replace('/+$', '') }}"
+    snow_api_key: "{{ lookup('ansible.builtin.env', 'SN_API_KEY') | trim }}"
+    snow_headers:
+      Accept: application/json
+      x-sn-apikey: "{{ snow_api_key }}"
+    snow_api: "{{ snow_host }}/api/now/table"
+    snow_cmdb_table: cmdb_ci_server
+    snow_cve_table: sn_vul_nvd_entry
+    snow_vi_table: sn_vul_vulnerable_item
+    # A vulnerable item must point to a vulnerability record. CVEs the NVD
+    # import has not brought in yet get a minimal record (id + erratum title);
+    # false skips and lists them instead. Needs create access to sn_vul_nvd_entry.
+    snow_create_missing_cves: true
+    snow_query_batch: 50
+
+  tasks:
+    # --- Satellite ----------------------------------------------------------
+
+    - name: List the applicable errata of the host
+      ansible.builtin.uri:
+        url: >-
+          {{ sat_api }}/api/hosts/{{ sat_host_id }}/errata?per_page=1000&search={{
+          sat_errata_search | urlencode }}
+        user: admin
+        password: "{{ satellite_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: sat_errata
+
+    # CVE -> errata that fix it, severity, a title for the summary.
+    - name: Collect the CVEs from the errata
+      ansible.builtin.set_fact:
+        sat_cve_details: >-
+          {{ sat_cve_details | default({}) | combine({
+               item.1.cve_id: {
+                 'advisories': ((sat_cve_details | default({})).get(item.1.cve_id, {}).get('advisories', []) + [item.0.errata_id]) | unique,
+                 'severity': item.0.severity | default('', true) or 'None',
+                 'title': item.0.title | default(item.1.cve_id)
+               }
+             }) }}
+      loop: "{{ sat_errata.json.results | subelements('cves', skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.0.errata_id }} {{ item.1.cve_id }}"
+
+    - name: Sort the CVEs
+      ansible.builtin.set_fact:
+        sat_cves: "{{ (sat_cve_details | default({})).keys() | list | sort }}"
+        sat_cve_details: "{{ sat_cve_details | default({}) }}"
+
+    - name: Stop for hosts without CVEs
+      ansible.builtin.meta: end_host
+      when: sat_cves | length == 0
+
+    # subscription-manager reports the SMBIOS serial as a fact; the CMDB CI
+    # from register-cmdb-ci.yml is keyed on the same serial.
+    - name: Read the host's serial number from Satellite
+      ansible.builtin.uri:
+        url: >-
+          {{ sat_api }}/api/hosts/{{ sat_host_id }}/facts?per_page=50&search={{
+          'name = dmi::system::serial_number' | urlencode }}
+        user: admin
+        password: "{{ satellite_admin_password }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: sat_facts
+
+    - name: Remember the serial number
+      ansible.builtin.set_fact:
+        cmdb_serial: >-
+          {{ (sat_facts.json.results | default({})).values() | map('dict2items') | flatten
+             | selectattr('key', 'eq', 'dmi::system::serial_number') | map(attribute='value') | first | default('') }}
+
+    # --- ServiceNow (same as sync-insights-cves.yml) -------------------------
+
+    - name: Look up the CMDB CI (by serial, else by name)
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_api }}/{{ snow_cmdb_table }}?sysparm_limit=1&sysparm_fields=sys_id,name&sysparm_query={{
+          (('serial_number=' ~ cmdb_serial) if cmdb_serial | length > 0 else ('name=' ~ inventory_hostname)) | urlencode }}
+        headers: "{{ snow_headers }}"
+      register: snow_ci
+      failed_when: false
+      no_log: true
+
+    - name: Check ServiceNow answered
+      ansible.builtin.assert:
+        that: snow_ci.status == 200
+        fail_msg: >-
+          {{ 'ServiceNow rejected the API key (check the key and the API Access Policy).'
+             if snow_ci.status == 401 else
+             'The API key has no read access to ' ~ snow_cmdb_table ~ '.'
+             if snow_ci.status == 403 else
+             'CMDB lookup failed: HTTP ' ~ snow_ci.status }}
+        quiet: true
+
+    # A scheduled run should not fail on one host without a CI: report and skip.
+    - name: Host has no CMDB CI yet
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: no {{ snow_cmdb_table }} CI with
+          {{ ('serial ' ~ cmdb_serial) if cmdb_serial else ('name ' ~ inventory_hostname) }};
+          skipped (run register-cmdb-ci.yml for it).
+      when: snow_ci.json.result | length == 0
+
+    - name: Skip hosts without a CI
+      ansible.builtin.meta: end_host
+      when: snow_ci.json.result | length == 0
+
+    - name: Look up the vulnerability records of the CVEs
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_api }}/{{ snow_cve_table }}?sysparm_limit={{ snow_query_batch }}&sysparm_fields=sys_id,id&sysparm_query={{
+          ('idIN' ~ item | join(',')) | urlencode }}
+        headers: "{{ snow_headers }}"
+      register: snow_cve_lookup
+      loop: "{{ sat_cves | batch(snow_query_batch) | list }}"
+      failed_when: false
+      no_log: true
+
+    - name: Create missing vulnerability records
+      ansible.builtin.uri:
+        url: "{{ snow_api }}/{{ snow_cve_table }}?sysparm_fields=sys_id,id"
+        method: POST
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          id: "{{ item }}"
+          summary: "{{ sat_cve_details[item].title | truncate(4000) }}"
+        status_code: 201
+      register: snow_cve_created
+      loop: "{{ sat_cves | difference(snow_cve_found | map(attribute='id')) }}"
+      vars:
+        snow_cve_found: "{{ snow_cve_lookup.results | selectattr('status', 'eq', 200) | map(attribute='json') | map(attribute='result') | flatten }}"
+      when: snow_create_missing_cves | bool
+      failed_when: false
+      no_log: true
+
+    - name: Map CVE ids to vulnerability records
+      ansible.builtin.set_fact:
+        snow_cve_ids: >-
+          {{ dict(snow_cve_records | map(attribute='id') | zip(snow_cve_records | map(attribute='sys_id'))) }}
+      vars:
+        snow_cve_records: >-
+          {{ (snow_cve_lookup.results | selectattr('status', 'eq', 200) | map(attribute='json') | map(attribute='result') | flatten)
+             + (snow_cve_created.results | default([]) | selectattr('status', 'defined') | selectattr('status', 'eq', 201)
+                | map(attribute='json') | map(attribute='result') | list) }}
+
+    - name: Check the vulnerability record lookups
+      ansible.builtin.assert:
+        that:
+          - snow_cve_lookup.results | rejectattr('status', 'eq', 200) | list | length == 0
+          - snow_cve_created.results | default([]) | selectattr('status', 'defined') | rejectattr('status', 'eq', 201) | list | length == 0
+        fail_msg: >-
+          Reading or creating {{ snow_cve_table }} records failed (403: no read or create
+          access to {{ snow_cve_table }}; snow_create_missing_cves: false only reads): HTTP
+          {{ (snow_cve_lookup.results + snow_cve_created.results | default([])) | selectattr('status', 'defined')
+             | map(attribute='status') | reject('in', [200, 201]) | unique | join(', ') }}
+        quiet: true
+
+    - name: List the vulnerable items that already exist for the CI
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_api }}/{{ snow_vi_table }}?sysparm_limit=10000&sysparm_exclude_reference_link=true&sysparm_fields=sys_id,vulnerability&sysparm_query={{
+          ('cmdb_ci=' ~ snow_ci.json.result[0].sys_id) | urlencode }}
+        headers: "{{ snow_headers }}"
+      register: snow_existing_vis
+      failed_when: false
+      no_log: true
+
+    - name: Check the existing vulnerable items were read
+      ansible.builtin.assert:
+        that: snow_existing_vis.status == 200
+        fail_msg: "Reading {{ snow_vi_table }} failed: HTTP {{ snow_existing_vis.status }} (does the API key's user have a Vulnerability Response role?)"
+        quiet: true
+
+    - name: Create the missing vulnerable items
+      ansible.builtin.uri:
+        url: "{{ snow_api }}/{{ snow_vi_table }}?sysparm_fields=sys_id,number"
+        method: POST
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          cmdb_ci: "{{ snow_ci.json.result[0].sys_id }}"
+          vulnerability: "{{ snow_cve_ids[item] }}"
+          work_notes: >-
+            Reported by Red Hat Satellite for {{ inventory_hostname }}:
+            fixed by {{ sat_cve_details[item].advisories | join(', ') }}
+            (severity {{ sat_cve_details[item].severity }}), available in Satellite.
+      register: snow_vi_created
+      loop: "{{ snow_cve_ids.keys() | difference(snow_cve_ids_with_vi) | sort }}"
+      vars:
+        snow_existing_vulns: "{{ snow_existing_vis.json.result | map(attribute='vulnerability') | list }}"
+        snow_cve_ids_with_vi: >-
+          {{ snow_cve_ids | dict2items | selectattr('value', 'in', snow_existing_vulns) | map(attribute='key') | list }}
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+    - name: Report the result
+      ansible.builtin.assert:
+        that: vi_failed | length == 0
+        fail_msg: >-
+          {{ vi_failed | length }} vulnerable item(s) could not be created
+          (HTTP {{ vi_failed | map(attribute='status') | unique | join(', ') }}):
+          {{ vi_failed | map(attribute='item') | join(', ') }}
+        success_msg: >-
+          {{ inventory_hostname }}: {{ sat_cves | length }} CVEs with a fix in Satellite,
+          {{ vi_created | length }} vulnerable items created,
+          {{ snow_cve_ids | length - vi_created | length }} already existed,
+          {{ cve_records_created | length }} {{ snow_cve_table }} records created,
+          {{ cves_skipped | length }} skipped (no {{ snow_cve_table }} record){{
+          (': ' ~ cves_skipped | join(', ')) if cves_skipped else '' }}.
+      vars:
+        vi_failed: "{{ snow_vi_created.results | rejectattr('status', 'eq', 201) | list }}"
+        vi_created: "{{ snow_vi_created.results | selectattr('status', 'eq', 201) | list }}"
+        cves_skipped: "{{ sat_cves | difference(snow_cve_ids.keys()) }}"
+        cve_records_created: >-
+          {{ snow_cve_created.results | default([]) | selectattr('status', 'defined')
+             | selectattr('status', 'eq', 201) | list }}
