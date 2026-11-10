@@ -139,25 +139,29 @@
         validate_certs: false
       register: sat_errata
 
-    # CVE -> errata that fix it, severity, a title for the summary.
+    # CVE -> errata that fix it, severity, a title for the summary (the last
+    # erratum listed wins for severity and title).
+    # One expression, not a set_fact loop over erratum/CVE pairs: that loop
+    # re-templated the growing dict per pair and cost ~70 s per host for
+    # ~2000 pairs, plus one AAP job event per pair.
     - name: Collect the CVEs from the errata
       ansible.builtin.set_fact:
         sat_cve_details: >-
-          {{ sat_cve_details | default({}) | combine({
-               item.1.cve_id: {
-                 'advisories': ((sat_cve_details | default({})).get(item.1.cve_id, {}).get('advisories', []) + [item.0.errata_id]) | unique,
-                 'severity': item.0.severity | default('', true) or 'None',
-                 'title': item.0.title | default(item.1.cve_id)
-               }
-             }) }}
-      loop: "{{ sat_errata.json.results | subelements('cves', skip_missing=True) }}"
-      loop_control:
-        label: "{{ item.0.errata_id }} {{ item.1.cve_id }}"
+          {%- set d = {} -%}
+          {%- for e in sat_errata.json.results | default([]) -%}
+            {%- for c in e.cves | default([]) -%}
+              {%- set prev = d.get(c.cve_id, {}).get('advisories', []) -%}
+              {%- set _ = d.update({c.cve_id: {
+                    'advisories': (prev + [e.errata_id]) | unique,
+                    'severity': e.severity | default('', true) or 'None',
+                    'title': e.title | default(c.cve_id)}}) -%}
+            {%- endfor -%}
+          {%- endfor -%}
+          {{ d }}
 
     - name: Sort the CVEs
       ansible.builtin.set_fact:
-        sat_cves: "{{ (sat_cve_details | default({})).keys() | list | sort }}"
-        sat_cve_details: "{{ sat_cve_details | default({}) }}"
+        sat_cves: "{{ sat_cve_details.keys() | list | sort }}"
 
     # Hosts without CVEs still continue: their open items may need closing.
     - name: Stop for hosts without CVEs when nothing is closed
@@ -455,19 +459,26 @@
                 ~ 'closed by the Satellite CVE sync for ' ~ inventory_hostname) }}
             (AAP job {{ tower_job_id | default('n/a') }}).
       register: snow_vi_closed
-      # "vulnerability.id" is one key (dot-walked field), so test it per item;
+      # Filter up front instead of per-item `when`: a `when` still loops over
+      # every open item and AAP records a "skipping" event for each one.
+      # "vulnerability.id" is one key (dot-walked field), hence the Jinja loop;
       # selectattr would read the dot as a nested attribute.
-      loop: "{{ snow_open_vis.json.result | default([]) }}"
+      loop: >-
+        {%- set out = [] -%}
+        {%- for i in snow_open_vis.json.result | default([]) -%}
+          {%- set v = i['vulnerability.id'] | default('', true) | upper -%}
+          {%- set orphan = (i['vulnerability.sys_class_name'] | default('', true)) == '' and v == '' -%}
+          {%- if (v is match('^CVE-') and v not in sat_cves)
+                 or (orphan and snow_close_orphaned_items | bool) -%}
+            {%- set _ = out.append(i) -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ out }}
       loop_control:
         label: "{{ item.number }} {{ item['vulnerability.id'] }}"
       vars:
         vid: "{{ item['vulnerability.id'] | default('', true) | upper }}"
-        orphaned: "{{ (item['vulnerability.sys_class_name'] | default('', true)) == '' and vid == '' }}"
-      when:
-        - snow_close_fixed_items | bool
-        - >-
-          (vid is match('^CVE-') and vid not in sat_cves)
-          or (orphaned | bool and snow_close_orphaned_items | bool)
+      when: snow_close_fixed_items | bool
       changed_when: snow_vi_closed.status | default(0) == 200
       failed_when: false
       no_log: true
@@ -483,14 +494,21 @@
         body_format: json
         body: "{{ snow_vi_fields }}"
       register: snow_vi_backfill
-      loop: "{{ snow_open_vis.json.result | default([]) }}"
+      # Filtered up front for the same reason as the resolve loop above.
+      loop: >-
+        {%- set out = [] -%}
+        {%- for i in snow_open_vis.json.result | default([]) -%}
+          {%- if i.assignment_group | default('', true) == ''
+                 and i['vulnerability.id'] | default('', true) | upper in sat_cves -%}
+            {%- set _ = out.append(i) -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ out }}
       loop_control:
         label: "{{ item.number }}"
       when:
         - snow_close_fixed_items | bool
         - snow_vi_fields.assignment_group is defined
-        - item.assignment_group | default('', true) == ''
-        - item['vulnerability.id'] | default('', true) | upper in sat_cves
       changed_when: snow_vi_backfill.status | default(0) == 200
       failed_when: false
       no_log: true
