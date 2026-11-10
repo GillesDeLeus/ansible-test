@@ -40,8 +40,9 @@
          | join(' and ') }}
 
   tasks:
+    # Ending this play before add_host leaves the next play with no hosts.
     - name: Skip when the CVE sync is disabled
-      ansible.builtin.meta: end_playbook
+      ansible.builtin.meta: end_play
       when: not (satellite_cves_sync | default(true) | bool)
 
     - name: Check the credentials
