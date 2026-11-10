@@ -312,6 +312,41 @@
       failed_when: false
       no_log: true
 
+    # Seen in practice: the only field ACL on vulnerability is a write rule
+    # with condition "Vulnerability is empty". On an insert through the Table
+    # API the incoming value is already set when the condition is evaluated,
+    # so the field is dropped. Setting it in a second call (create, then
+    # update) may pass; try that on the test item before giving up.
+    - name: Set the link on the test item in a second call
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_api }}/{{ snow_vi_table }}/{{ snow_vi_probe.json.result.sys_id }}?sysparm_exclude_reference_link=true&sysparm_fields=sys_id,number,vulnerability
+        method: PATCH
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          vulnerability: "{{ snow_cve_ids[vi_to_create[0]] }}"
+      register: snow_vi_probe_patch
+      when:
+        - vi_to_create | length > 0
+        - snow_vi_probe.status | default(0) == 201
+        - snow_vi_probe.json.result.vulnerability | default('', true) == ''
+      changed_when: snow_vi_probe_patch.status | default(0) == 200
+      failed_when: false
+      no_log: true
+
+    # create = the link survives the insert; patch = it needs a second call.
+    - name: Decide how to set the vulnerability link
+      ansible.builtin.set_fact:
+        vi_link_mode: >-
+          {{ 'create' if snow_vi_probe.json.result.vulnerability | default('', true) != ''
+             else 'patch' if (snow_vi_probe_patch.status | default(0) == 200
+                              and snow_vi_probe_patch.json.result.vulnerability | default('', true) != '')
+             else 'none' }}
+      when:
+        - vi_to_create | length > 0
+        - snow_vi_probe.status | default(0) == 201
+
     - name: Remove the test item when ServiceNow dropped its link
       ansible.builtin.uri:
         url: "{{ snow_api }}/{{ snow_vi_table }}/{{ snow_vi_probe.json.result.sys_id }}"
@@ -319,10 +354,7 @@
         headers: "{{ snow_headers }}"
         status_code: [200, 204]
       register: snow_vi_probe_delete
-      when:
-        - vi_to_create | length > 0
-        - snow_vi_probe.status | default(0) == 201
-        - snow_vi_probe.json.result.vulnerability | default('', true) == ''
+      when: vi_link_mode | default('') == 'none'
       failed_when: false
       no_log: true
 
@@ -330,16 +362,14 @@
       ansible.builtin.fail:
         msg: >-
           ServiceNow created {{ snow_vi_probe.json.result.number }} but stored it without the
-          vulnerability {{ vi_to_create[0] }} ({{ snow_cve_ids[vi_to_create[0]] }}), so the
+          vulnerability {{ vi_to_create[0] }} ({{ snow_cve_ids[vi_to_create[0]] }}), also when it was
+          set in a second call (HTTP {{ snow_vi_probe_patch.status | default('n/a') }}), so the
           remaining {{ vi_to_create | length - 1 }} items were not created.
           {{ 'The test item was deleted.' if snow_vi_probe_delete.status | default(0) in [200, 204]
              else 'Delete it by hand (the API key cannot delete ' ~ snow_vi_table ~ ' records).' }}
-          Check, as the API key's user, write access to {{ snow_vi_table }}.vulnerability
-          (field ACL), its reference qualifier, and insert business rules on {{ snow_vi_table }}.
-      when:
-        - vi_to_create | length > 0
-        - snow_vi_probe.status | default(0) == 201
-        - snow_vi_probe.json.result.vulnerability | default('', true) == ''
+          Likely the write ACL on {{ snow_vi_table }}.vulnerability (condition "Vulnerability is
+          empty"): add a field "create" ACL for the API user's role without that condition.
+      when: vi_link_mode | default('') == 'none'
 
     - name: Create the other missing vulnerable items
       ansible.builtin.uri:
@@ -358,6 +388,26 @@
       register: snow_vi_created
       # The first item was created (or failed) above.
       loop: "{{ vi_to_create[1:] if snow_vi_probe.status | default(0) == 201 else vi_to_create }}"
+      changed_when: true
+      failed_when: false
+      no_log: true
+
+    - name: Set the vulnerability link on the new items in a second call
+      ansible.builtin.uri:
+        url: >-
+          {{ snow_api }}/{{ snow_vi_table }}/{{ item.json.result.sys_id }}?sysparm_exclude_reference_link=true&sysparm_fields=sys_id,number,vulnerability
+        method: PATCH
+        headers: "{{ snow_headers }}"
+        body_format: json
+        body:
+          vulnerability: "{{ snow_cve_ids[item.item] }}"
+      register: snow_vi_patched
+      loop: >-
+        {{ snow_vi_created.results | selectattr('status', 'defined') | selectattr('status', 'eq', 201)
+           | rejectattr('json.result.vulnerability', 'truthy') | list }}
+      loop_control:
+        label: "{{ item.item }}"
+      when: vi_link_mode | default('create') == 'patch'
       changed_when: true
       failed_when: false
       no_log: true
@@ -457,9 +507,16 @@
           {{ vi_failed | length }} vulnerable item(s) could not be created or resolved
           (HTTP {{ vi_failed | map(attribute='status') | unique | join(', ') }}; a 200 on a
           resolve means a business rule, ACL or missing role kept the old state):
-          {{ ((vi_failed | map(attribute='item', default=vi_to_create[0] | default('')) | select('string') | list)
-              + (vi_failed | map(attribute='item', default='') | reject('string') | map(attribute='number') | list))
-             | join(', ') | truncate(500) }}
+          {% set names = [] -%}
+          {%- for f in vi_failed -%}
+            {%- set i = f.item | default(none) -%}
+            {%- if i is string -%}{%- set _ = names.append(i) -%}
+            {%- elif i is mapping and i.item is defined -%}{%- set _ = names.append(i.item) -%}
+            {%- elif i is mapping and i.number is defined -%}{%- set _ = names.append(i.number) -%}
+            {%- else -%}{%- set _ = names.append(vi_to_create[0] | default('?')) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ names | join(', ') | truncate(500) }}
         success_msg: >-
           {{ inventory_hostname }}: {{ sat_cves | length }} CVEs with a fix in Satellite,
           {{ vi_created | length }} vulnerable items created,
@@ -470,17 +527,30 @@
           {{ cves_skipped | length }} skipped (no {{ snow_cve_table }} record){{
           (': ' ~ cves_skipped | join(', ')) if cves_skipped else '' }}.
       vars:
+        # Attempts per item: create, plus a second call (patch) when needed.
         vi_all_creates: "{{ ([snow_vi_probe] if snow_vi_probe.status is defined else []) + snow_vi_created.results }}"
-        vi_created: >-
+        vi_all_patches: >-
+          {{ ([snow_vi_probe_patch] if snow_vi_probe_patch.status is defined else [])
+             + snow_vi_patched.results | default([]) | selectattr('status', 'defined') | list }}
+        vi_linked_on_create: >-
           {{ vi_all_creates | selectattr('status', 'eq', 201)
              | selectattr('json.result.vulnerability', 'truthy') | list }}
+        vi_linked_by_patch: >-
+          {{ vi_all_patches | selectattr('status', 'eq', 200)
+             | selectattr('json.result.vulnerability', 'truthy') | list }}
+        vi_created: "{{ vi_linked_on_create + vi_linked_by_patch }}"
         # Resolved = API 200 and the stored state really is the resolved one.
         vi_close_results: "{{ snow_vi_closed.results | default([]) | selectattr('status', 'defined') | list }}"
         vi_closed: >-
           {{ vi_close_results | selectattr('status', 'eq', 200)
              | selectattr('json.result.state', 'eq', snow_vi_resolved_state) | list }}
+        # Failed: create not accepted, or still unlinked after the second call.
         vi_failed: >-
-          {{ vi_all_creates | reject('in', vi_created) | list
+          {{ vi_all_creates | rejectattr('status', 'eq', 201) | list
+             + (vi_all_creates | selectattr('status', 'eq', 201)
+                | rejectattr('json.result.vulnerability', 'truthy') | list
+                if vi_link_mode | default('create') != 'patch' else [])
+             + vi_all_patches | reject('in', vi_linked_by_patch) | list
              + vi_close_results | reject('in', vi_closed) | list }}
         cves_skipped: "{{ sat_cves | difference(snow_cve_ids.keys()) }}"
         cve_records_created: >-
